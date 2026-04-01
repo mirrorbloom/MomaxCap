@@ -1,8 +1,10 @@
 import AVFoundation
 import CoreMotion
+import CoreVideo
 import Darwin
 import Foundation
 import QuartzCore
+import simd
 import UIKit
 
 enum SlamRecordingError: LocalizedError {
@@ -28,14 +30,14 @@ enum SlamRecordingError: LocalizedError {
   }
 }
 
-// MARK: - JSONL 缓冲（P1：停止时按 time 升序落盘）
+// MARK: - JSONL
 
-/// 同一时间戳下的稳定次序：陀螺 → 加速度 →（可选）温度 → 视频帧。
 private enum JsonlLineKind: Int {
   case gyroscope = 0
   case accelerometer = 1
-  case imuTemperature = 2
-  case frame = 3
+  case magnetometer = 2
+  case imuTemperature = 3
+  case frame = 4
 }
 
 private struct PendingJsonlLine {
@@ -44,41 +46,84 @@ private struct PendingJsonlLine {
   let object: [String: Any]
 }
 
-/// P0 + P1：单目视频 + IMU；JSONL 内存缓冲、停止时按 `time` 排序写入；录制开始后锁定对焦/曝光；`calibration.json` 仍为占位内参。
-///
-/// 单位（与 Spectacular DATA_FORMAT 一致）：`gyroscope` 为 **rad/s**（`CMDeviceMotion.rotationRate`）；
-/// `accelerometer` 为 **m/s²**，当前为 `gravity + userAcceleration`（含重力，与设备参考系一致）。
-final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+/// 采集模式：LiDAR 深度 + 广角 RGB（样例风格第二路 gray+depthScale）、或 MultiCam 广角+超广角双 RGB、或单广角。
+private enum DualCaptureMode {
+  /// `data.mov` 广角 RGB + `data2.mov` 深度图转灰度（与样例 `colorFormat: gray`、`depthScale` 一致）
+  case depthAndWide
+  /// `data.mov` 广角 + `data2.mov` 超广角 RGB（无 LiDAR 时回退）
+  case multiCamRgb
+  /// 仅广角（配置失败时）
+  case singleWide
+}
+
+/// Spectacular 风格：`data.mov` + 可选 `data2.mov`，JSONL 双 `frames`；IMU 与 P1 行为保留。
+final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDelegate,
+  AVCaptureVideoDataOutputSampleBufferDelegate
+{
   let outputDirectory: URL
 
   private let syncQueue = DispatchQueue(label: "com.binwu.reconstruction.spatial_data_recorder.recording")
   private let videoQueue = DispatchQueue(label: "com.binwu.reconstruction.spatial_data_recorder.video")
   private let motionQueue = OperationQueue()
+  private let magnetometerQueue = OperationQueue()
 
   private var captureSession: AVCaptureSession?
   private var captureDevice: AVCaptureDevice?
+  private var secondCaptureDevice: AVCaptureDevice?
   private var videoOutput: AVCaptureVideoDataOutput?
+  private var depthOutput: AVCaptureDepthDataOutput?
+  private var secondVideoOutput: AVCaptureVideoDataOutput?
+  private var dataOutputSynchronizer: AVCaptureDataOutputSynchronizer?
+
   private var assetWriter: AVAssetWriter?
   private var videoInput: AVAssetWriterInput?
+  private var assetWriter2: AVAssetWriter?
+  private var videoInput2: AVAssetWriterInput?
 
   private var pendingJsonl: [PendingJsonlLine] = []
 
   private let motionManager = CMMotionManager()
 
-  /// 与首帧对齐后的单调时钟原点（秒，从 0 起算 IMU）
+  private var captureMode: DualCaptureMode = .singleWide
+
   private var timeOriginMedia: CFTimeInterval = 0
   private var firstVideoPts: CMTime?
   private var frameIndex: Int = 0
   private var videoWidth: Int = 0
   private var videoHeight: Int = 0
+  private var videoWidth2: Int = 0
+  private var videoHeight2: Int = 0
+
+  private var lockedExposureDurationSeconds: Double = 0.01
+
+  private var lastFocalLengthX: Double = 0
+  private var lastFocalLengthY: Double = 0
+  private var lastPrincipalPointX: Double = 0
+  private var lastPrincipalPointY: Double = 0
+  private var didUpdateIntrinsicsFromSample = false
+
+  private var lastSecondFocalLengthX: Double = 0
+  private var lastSecondFocalLengthY: Double = 0
+  private var lastSecondPrincipalPointX: Double = 0
+  private var lastSecondPrincipalPointY: Double = 0
+  private var didUpdateSecondIntrinsics = false
+
+  /// MultiCam：待配对的超广角缓冲
+  private var ultraBufferQueue: [CMSampleBuffer] = []
+  private var pendingWideBuffers: [CMSampleBuffer] = []
 
   private var isStopping = false
   private var didStartWriter = false
+
+  /// 样例与 Spectacular 常用：米/灰度量化（仅作语义对齐；实际深度以 Float 录制为准）
+  private let jsonDepthScale: Double = 0.001
 
   init(outputDirectory: URL) {
     self.outputDirectory = outputDirectory
     motionQueue.name = "com.binwu.reconstruction.spatial_data_recorder.motion"
     motionQueue.maxConcurrentOperationCount = 1
+    magnetometerQueue.name = "com.binwu.reconstruction.spatial_data_recorder.magnetometer"
+    magnetometerQueue.maxConcurrentOperationCount = 1
   }
 
   func start(completion: @escaping (Error?) -> Void) {
@@ -101,7 +146,180 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     }
   }
 
+  // MARK: - Session setup
+
   private func configureCaptureAndRun(completion: @escaping (Error?) -> Void) {
+    if configureDepthAndWideSession() {
+      captureMode = .depthAndWide
+    } else if configureMultiCamSession() {
+      captureMode = .multiCamRgb
+    } else if configureSingleWideSession() {
+      captureMode = .singleWide
+    } else {
+      DispatchQueue.main.async { completion(SlamRecordingError.captureSetupFailed) }
+      return
+    }
+
+    captureSession?.startRunning()
+
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else {
+        completion(nil)
+        return
+      }
+      UIApplication.shared.isIdleTimerDisabled = true
+      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+        self?.applyFocusExposureLockIfPossible()
+      }
+      completion(nil)
+    }
+  }
+
+  /// LiDAR：同步广角 RGB + 深度图（优先，与样例第二路 gray + depthScale 一致）
+  private func configureDepthAndWideSession() -> Bool {
+    guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
+      return false
+    }
+
+    guard let format = Self.pickFormatWithDepth(device: device) else { return false }
+
+    let session = AVCaptureSession()
+    session.beginConfiguration()
+    session.sessionPreset = .inputPriority
+
+    do {
+      try device.lockForConfiguration()
+      device.activeFormat = format
+      device.unlockForConfiguration()
+    } catch {
+      session.commitConfiguration()
+      return false
+    }
+
+    guard let input = try? AVCaptureDeviceInput(device: device), session.canAddInput(input) else {
+      session.commitConfiguration()
+      return false
+    }
+    session.addInput(input)
+
+    let vOut = AVCaptureVideoDataOutput()
+    vOut.videoSettings = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    ]
+    vOut.alwaysDiscardsLateVideoFrames = true
+
+    let dOut = AVCaptureDepthDataOutput()
+    dOut.isFilteringEnabled = true
+    dOut.alwaysDiscardsLateDepthData = true
+
+    guard session.canAddOutput(vOut), session.canAddOutput(dOut) else {
+      session.commitConfiguration()
+      return false
+    }
+    session.addOutput(vOut)
+    session.addOutput(dOut)
+
+    if let conn = vOut.connection(with: .video), conn.isCameraIntrinsicMatrixDeliverySupported {
+      conn.isCameraIntrinsicMatrixDeliveryEnabled = true
+    }
+
+    session.commitConfiguration()
+
+    let sync = AVCaptureDataOutputSynchronizer(dataOutputs: [vOut, dOut])
+    sync.setDelegate(self, queue: videoQueue)
+
+    captureSession = session
+    captureDevice = device
+    videoOutput = vOut
+    depthOutput = dOut
+    secondCaptureDevice = nil
+    secondVideoOutput = nil
+    dataOutputSynchronizer = sync
+    return true
+  }
+
+  private static func pickFormatWithDepth(device: AVCaptureDevice) -> AVCaptureDevice.Format? {
+    var best: AVCaptureDevice.Format?
+    var bestArea: Int32 = 0
+    for format in device.formats {
+      if format.supportedDepthDataFormats.isEmpty { continue }
+      let dim = format.formatDescription.dimensions
+      let area = dim.width * dim.height
+      if area > bestArea {
+        bestArea = area
+        best = format
+      }
+    }
+    return best
+  }
+
+  /// 双路 RGB：广角 + 超广角（无 LiDAR 深度时）
+  private func configureMultiCamSession() -> Bool {
+    guard
+      let wide = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
+      let ultra = AVCaptureDevice.default(.builtInUltraWideCamera, for: .video, position: .back)
+    else {
+      return false
+    }
+    guard AVCaptureMultiCamSession.isMultiCamSupported(for: [wide, ultra]) else { return false }
+
+    let session = AVCaptureMultiCamSession()
+    session.beginConfiguration()
+    session.sessionPreset = .high
+
+    guard
+      let inWide = try? AVCaptureDeviceInput(device: wide),
+      let inUltra = try? AVCaptureDeviceInput(device: ultra),
+      session.canAddInput(inWide),
+      session.canAddInput(inUltra)
+    else {
+      session.commitConfiguration()
+      return false
+    }
+    session.addInput(inWide)
+    session.addInput(inUltra)
+
+    let outWide = AVCaptureVideoDataOutput()
+    outWide.videoSettings = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    ]
+    outWide.alwaysDiscardsLateVideoFrames = true
+    outWide.setSampleBufferDelegate(self, queue: videoQueue)
+
+    let outUltra = AVCaptureVideoDataOutput()
+    outUltra.videoSettings = [
+      kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+    ]
+    outUltra.alwaysDiscardsLateVideoFrames = true
+    outUltra.setSampleBufferDelegate(self, queue: videoQueue)
+
+    guard session.canAddOutput(outWide), session.canAddOutput(outUltra) else {
+      session.commitConfiguration()
+      return false
+    }
+    session.addOutput(outWide)
+    session.addOutput(outUltra)
+
+    if let conn = outWide.connection(with: .video), conn.isCameraIntrinsicMatrixDeliverySupported {
+      conn.isCameraIntrinsicMatrixDeliveryEnabled = true
+    }
+    if let conn = outUltra.connection(with: .video), conn.isCameraIntrinsicMatrixDeliverySupported {
+      conn.isCameraIntrinsicMatrixDeliveryEnabled = true
+    }
+
+    session.commitConfiguration()
+
+    captureSession = session
+    captureDevice = wide
+    secondCaptureDevice = ultra
+    videoOutput = outWide
+    secondVideoOutput = outUltra
+    depthOutput = nil
+    dataOutputSynchronizer = nil
+    return true
+  }
+
+  private func configureSingleWideSession() -> Bool {
     let session = AVCaptureSession()
     session.sessionPreset = .high
 
@@ -110,11 +328,9 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       let input = try? AVCaptureDeviceInput(device: device),
       session.canAddInput(input)
     else {
-      DispatchQueue.main.async { completion(SlamRecordingError.captureSetupFailed) }
-      return
+      return false
     }
     session.addInput(input)
-    captureDevice = device
 
     let output = AVCaptureVideoDataOutput()
     output.videoSettings = [
@@ -123,10 +339,7 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     output.alwaysDiscardsLateVideoFrames = true
     output.setSampleBufferDelegate(self, queue: videoQueue)
 
-    guard session.canAddOutput(output) else {
-      DispatchQueue.main.async { completion(SlamRecordingError.captureSetupFailed) }
-      return
-    }
+    guard session.canAddOutput(output) else { return false }
     session.addOutput(output)
 
     if let conn = output.connection(with: .video), conn.isCameraIntrinsicMatrixDeliverySupported {
@@ -134,70 +347,164 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     }
 
     captureSession = session
+    captureDevice = device
     videoOutput = output
+    secondVideoOutput = nil
+    depthOutput = nil
+    dataOutputSynchronizer = nil
+    return true
+  }
 
-    session.startRunning()
+  // MARK: - AVCaptureDataOutputSynchronizerDelegate（深度 + 广角）
 
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else {
-        completion(nil)
-        return
-      }
-      UIApplication.shared.isIdleTimerDisabled = true
-      /// 短延迟后再锁定对焦/曝光，使 AE/AF 先收敛（见 `Flutter-iOS-SLAM数据采集应用开发指南` §4.1）。
-      DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
-        self?.applyFocusExposureLockIfPossible()
-      }
-      completion(nil)
+  func dataOutputSynchronizer(
+    _ synchronizer: AVCaptureDataOutputSynchronizer,
+    didOutput synchronizedDataCollection: AVCaptureSynchronizedDataCollection
+  ) {
+    syncQueue.async { [weak self] in
+      self?.processSynchronizedDepthWide(synchronizedDataCollection)
     }
   }
 
-  /// 对焦与曝光锁定（链式 completion）。白平衡在曝光完成后尽量锁定，减少录制中漂移。
-  private func applyFocusExposureLockIfPossible() {
-    guard let device = captureDevice else { return }
+  private func processSynchronizedDepthWide(_ collection: AVCaptureSynchronizedDataCollection) {
+    guard !isStopping, let vOut = videoOutput, let dOut = depthOutput else { return }
 
-    let lensPosition = min(max(device.lensPosition, 0), 1)
-
-    do {
-      try device.lockForConfiguration()
-      if device.isFocusPointOfInterestSupported {
-        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
-      }
-      if device.isExposurePointOfInterestSupported {
-        device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
-      }
-      device.unlockForConfiguration()
-    } catch {
+    guard
+      let vidSync = collection.synchronizedData(for: vOut) as? AVCaptureSynchronizedSampleBufferData,
+      let sampleBuffer = vidSync.sampleBuffer
+    else {
       return
     }
 
-    device.setFocusModeLocked(lensPosition: lensPosition) { [weak self] _ in
-      guard let device = self?.captureDevice else { return }
-      do {
-        try device.lockForConfiguration()
-        guard device.isExposureModeSupported(.custom) else {
-          device.unlockForConfiguration()
-          return
+    var depthDataObj: AVDepthData?
+    if let depSync = collection.synchronizedData(for: dOut) as? AVCaptureSynchronizedDepthData,
+       !depSync.depthDataWasDropped,
+       let dd = depSync.depthData
+    {
+      depthDataObj = dd
+    }
+
+    guard let depthData = depthDataObj,
+          let grayBuffer = Self.depthFloat32ToGrayBGRA(depthData: depthData)
+    else {
+      return
+    }
+
+    if let cal = depthData.cameraCalibrationData {
+      let m = cal.intrinsicMatrix
+      let fx = Double(m.columns.0.x)
+      let fy = Double(m.columns.1.y)
+      let cx = Double(m.columns.2.x)
+      let cy = Double(m.columns.2.y)
+      lastSecondFocalLengthX = fx
+      lastSecondFocalLengthY = fy
+      lastSecondPrincipalPointX = cx
+      lastSecondPrincipalPointY = cy
+      didUpdateSecondIntrinsics = fx > 1 && fy > 1
+    }
+
+    guard let sb2 = Self.makeSampleBuffer(from: grayBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
+    else {
+      return
+    }
+    processVideoSampleBuffer(sampleBuffer, secondSample: sb2, depthCalibration: depthData.cameraCalibrationData)
+  }
+
+  /// 将深度图转为 BGRA8，用于写入 `data2.mov`
+  private static func depthFloat32ToGrayBGRA(depthData: AVDepthData) -> CVPixelBuffer? {
+    let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
+    guard let depthMap = converted.depthDataMap else { return nil }
+
+    let w = CVPixelBufferGetWidth(depthMap)
+    let h = CVPixelBufferGetHeight(depthMap)
+    let pf = CVPixelBufferGetPixelFormatType(depthMap)
+    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+    guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+    let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+
+    func readDepth(x: Int, y: Int) -> Float {
+      let o = y * rowBytes + x * MemoryLayout<Float>.size
+      guard pf == kCVPixelFormatType_DepthFloat32 else { return .nan }
+      return base.load(fromByteOffset: o, as: Float.self)
+    }
+
+    var minV: Float = .greatestFiniteMagnitude
+    var maxV: Float = -.greatestFiniteMagnitude
+    for y in 0..<h {
+      for x in 0..<w {
+        let v = readDepth(x: x, y: y)
+        if v.isFinite {
+          minV = min(minV, v)
+          maxV = max(maxV, v)
         }
-        let duration = device.exposureDuration
-        let iso = min(max(device.iso, device.activeFormat.minISO), device.activeFormat.maxISO)
-        device.setExposureModeCustom(duration: duration, iso: iso) { _ in
-          guard let device = self?.captureDevice else { return }
-          do {
-            try device.lockForConfiguration()
-            if device.isWhiteBalanceModeSupported(.locked) {
-              device.whiteBalanceMode = .locked
-            }
-            device.unlockForConfiguration()
-          } catch {
-            try? device.unlockForConfiguration()
-          }
-        }
-      } catch {
-        try? device.unlockForConfiguration()
       }
     }
+    let range = max(maxV - minV, 1e-4)
+
+    var outBuf: CVPixelBuffer?
+    let attrs: [CFString: Any] = [
+      kCVPixelBufferCGImageCompatibilityKey: true,
+      kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+    ]
+    CVPixelBufferCreate(
+      kCFAllocatorDefault,
+      w,
+      h,
+      kCVPixelFormatType_32BGRA,
+      attrs as CFDictionary,
+      &outBuf
+    )
+    guard let out = outBuf else { return nil }
+
+    CVPixelBufferLockBaseAddress(out, [])
+    defer { CVPixelBufferUnlockBaseAddress(out, []) }
+    guard let outBase = CVPixelBufferGetBaseAddress(out) else { return nil }
+    let outRowBytes = CVPixelBufferGetBytesPerRow(out)
+    for y in 0..<h {
+      var outRow = outBase.advanced(by: y * outRowBytes).assumingMemoryBound(to: UInt8.self)
+      for x in 0..<w {
+        let v = readDepth(x: x, y: y)
+        let g: UInt8
+        if v.isFinite {
+          let n = (v - minV) / range
+          g = UInt8(min(255, max(0, n * 255)))
+        } else {
+          g = 0
+        }
+        outRow[0] = g
+        outRow[1] = g
+        outRow[2] = g
+        outRow[3] = 255
+        outRow = outRow.advanced(by: 4)
+      }
+    }
+    return out
   }
+
+  private static func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+    var timing = CMSampleTimingInfo(
+      duration: CMTime.invalid,
+      presentationTimeStamp: pts,
+      decodeTimeStamp: CMTime.invalid
+    )
+    var formatDesc: CMFormatDescription?
+    CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &formatDesc)
+    guard let fmt = formatDesc else { return nil }
+
+    var sb: CMSampleBuffer?
+    CMSampleBufferCreateReadyWithImageBuffer(
+      allocator: kCFAllocatorDefault,
+      imageBuffer: pixelBuffer,
+      formatDescription: fmt,
+      sampleTiming: &timing,
+      sampleBufferOut: &sb
+    )
+    return sb
+  }
+
+  // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate（MultiCam / 单目）
 
   func captureOutput(
     _ output: AVCaptureOutput,
@@ -205,15 +512,70 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     from connection: AVCaptureConnection
   ) {
     syncQueue.async { [weak self] in
-      self?.processVideoSampleBuffer(sampleBuffer)
+      guard let self = self else { return }
+      switch self.captureMode {
+      case .singleWide:
+        if output === self.videoOutput {
+          self.processVideoSampleBuffer(sampleBuffer, secondSample: nil, depthCalibration: nil)
+        }
+      case .multiCamRgb:
+        self.handleMultiCamOutput(output: output, sampleBuffer: sampleBuffer)
+      case .depthAndWide:
+        break
+      }
     }
   }
 
-  private func processVideoSampleBuffer(_ sampleBuffer: CMSampleBuffer) {
+  private func handleMultiCamOutput(output: AVCaptureOutput, sampleBuffer: CMSampleBuffer) {
+    guard captureMode == .multiCamRgb else { return }
+    if output === videoOutput {
+      pendingWideBuffers.append(sampleBuffer)
+      while pendingWideBuffers.count > 30 {
+        pendingWideBuffers.removeFirst()
+      }
+      tryPairWideUltra()
+    } else if output === secondVideoOutput {
+      ultraBufferQueue.append(sampleBuffer)
+      while ultraBufferQueue.count > 30 {
+        ultraBufferQueue.removeFirst()
+      }
+      tryPairWideUltra()
+    }
+  }
+
+  private func tryPairWideUltra() {
+    guard !pendingWideBuffers.isEmpty, !ultraBufferQueue.isEmpty else { return }
+    let wide = pendingWideBuffers.first!
+    let wPts = CMSampleBufferGetPresentationTimeStamp(wide)
+
+    var bestIdx: Int?
+    var bestDiff = CMTime(seconds: 1, preferredTimescale: 600)
+    for (i, u) in ultraBufferQueue.enumerated() {
+      let uPts = CMSampleBufferGetPresentationTimeStamp(u)
+      let d = CMTimeAbsoluteValue(CMTimeSubtract(wPts, uPts))
+      if CMTimeCompare(d, bestDiff) < 0 {
+        bestDiff = d
+        bestIdx = i
+      }
+    }
+    guard let idx = bestIdx, CMTimeGetSeconds(bestDiff) < 0.05 else { return }
+
+    let ultra = ultraBufferQueue.remove(at: idx)
+    pendingWideBuffers.removeFirst()
+    processVideoSampleBuffer(wide, secondSample: ultra, depthCalibration: nil)
+  }
+
+  // MARK: - 统一处理
+
+  private func processVideoSampleBuffer(
+    _ sampleBuffer: CMSampleBuffer,
+    secondSample: CMSampleBuffer?,
+    depthCalibration: AVCameraCalibrationData?
+  ) {
     guard !isStopping else { return }
 
     if assetWriter == nil {
-      guard startWriterIfNeeded(with: sampleBuffer) else { return }
+      guard startWritersIfNeeded(with: sampleBuffer, second: secondSample) else { return }
     }
 
     guard
@@ -225,25 +587,48 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       return
     }
 
+    let hasSecond = captureMode != .singleWide && secondSample != nil && assetWriter2 != nil && videoInput2 != nil
+
     if !didStartWriter {
       let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
       writer.startSession(atSourceTime: pts)
+      if hasSecond, let w2 = assetWriter2 {
+        w2.startSession(atSourceTime: pts)
+      }
       firstVideoPts = pts
       timeOriginMedia = CACurrentMediaTime()
       startMotion()
       didStartWriter = true
-      appendFrameJsonl(number: frameIndex, sampleBuffer: sampleBuffer)
+      appendFrameJsonl(
+        number: frameIndex,
+        wideSample: sampleBuffer,
+        secondSample: secondSample,
+        isDepthGray: captureMode == .depthAndWide,
+        depthCalibration: depthCalibration
+      )
       frameIndex += 1
       input.append(sampleBuffer)
+      if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+        i2.append(sb2)
+      }
       return
     }
 
-    appendFrameJsonl(number: frameIndex, sampleBuffer: sampleBuffer)
+    appendFrameJsonl(
+      number: frameIndex,
+      wideSample: sampleBuffer,
+      secondSample: secondSample,
+      isDepthGray: captureMode == .depthAndWide,
+      depthCalibration: depthCalibration
+    )
     frameIndex += 1
     input.append(sampleBuffer)
+    if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+      i2.append(sb2)
+    }
   }
 
-  private func startWriterIfNeeded(with sampleBuffer: CMSampleBuffer) -> Bool {
+  private func startWritersIfNeeded(with sampleBuffer: CMSampleBuffer, second: CMSampleBuffer?) -> Bool {
     guard let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return false }
     let width = CVPixelBufferGetWidth(pixelBuffer)
     let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -269,75 +654,159 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       let input = AVAssetWriterInput(mediaType: .video, outputSettings: videoSettings)
       input.expectsMediaDataInRealTime = true
 
-      guard writer.canAdd(input) else {
+      guard writer.canAdd(input), writer.startWriting() else {
         return false
       }
       writer.add(input)
 
-      guard writer.startWriting() else {
-        return false
-      }
-
       assetWriter = writer
       videoInput = input
-      return true
     } catch {
       return false
     }
-  }
 
-  private func startMotion() {
-    guard motionManager.isDeviceMotionAvailable else { return }
-    motionManager.deviceMotionUpdateInterval = 1.0 / 100.0
-    motionManager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] motion, _ in
-      guard let self = self, let m = motion else { return }
-      self.syncQueue.async {
-        self.appendImuLines(from: m)
-      }
+    guard captureMode != .singleWide, let sec = second, let pb2 = CMSampleBufferGetImageBuffer(sec) else {
+      return true
     }
+
+    let w2 = CVPixelBufferGetWidth(pb2)
+    let h2 = CVPixelBufferGetHeight(pb2)
+    videoWidth2 = w2
+    videoHeight2 = h2
+
+    let movie2URL = outputDirectory.appendingPathComponent("data2.mov")
+    try? FileManager.default.removeItem(at: movie2URL)
+
+    do {
+      let writer2 = try AVAssetWriter(outputURL: movie2URL, fileType: .mov)
+      let settings2: [String: Any] = [
+        AVVideoCodecKey: AVVideoCodecType.h264,
+        AVVideoWidthKey: w2,
+        AVVideoHeightKey: h2,
+        AVVideoCompressionPropertiesKey: [
+          AVVideoAverageBitRateKey: w2 * h2 * 2,
+          AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+          AVVideoMaxKeyFrameIntervalKey: 60,
+        ] as [String: Any],
+      ]
+      let input2 = AVAssetWriterInput(mediaType: .video, outputSettings: settings2)
+      input2.expectsMediaDataInRealTime = true
+      guard writer2.canAdd(input2), writer2.startWriting() else {
+        return true
+      }
+      writer2.add(input2)
+      assetWriter2 = writer2
+      videoInput2 = input2
+    } catch {
+      assetWriter2 = nil
+      videoInput2 = nil
+    }
+
+    return true
   }
 
-  private func appendImuLines(from motion: CMDeviceMotion) {
-    guard !isStopping, didStartWriter else { return }
-
-    let t = CACurrentMediaTime() - timeOriginMedia
-    let gx = motion.rotationRate.x
-    let gy = motion.rotationRate.y
-    let gz = motion.rotationRate.z
-
-    let ax = motion.gravity.x + motion.userAcceleration.x
-    let ay = motion.gravity.y + motion.userAcceleration.y
-    let az = motion.gravity.z + motion.userAcceleration.z
-
-    enqueueJsonl(
-      time: t,
-      kind: .gyroscope,
-      object: [
-        "time": t,
-        "sensor": [
-          "type": "gyroscope",
-          "values": [gx, gy, gz],
-        ],
-      ]
-    )
-    enqueueJsonl(
-      time: t,
-      kind: .accelerometer,
-      object: [
-        "time": t,
-        "sensor": [
-          "type": "accelerometer",
-          "values": [ax, ay, az],
-        ],
-      ]
-    )
+  private static func intrinsicCalibration(from sampleBuffer: CMSampleBuffer) -> (
+    fx: Double, fy: Double, cx: Double, cy: Double
+  )? {
+    guard
+      let att = CMGetAttachment(
+        sampleBuffer,
+        key: kCMSampleBufferAttachmentKey_CameraIntrinsicMatrix,
+        attachmentModeOut: nil
+      ),
+      CFGetTypeID(att) == CFDataGetTypeID(),
+      let data = att as? Data
+    else {
+      return nil
+    }
+    guard data.count >= MemoryLayout<matrix_float3x3>.size else { return nil }
+    let m = data.withUnsafeBytes { raw -> matrix_float3x3 in
+      raw.load(as: matrix_float3x3.self)
+    }
+    let fx = Double(m.columns.0.x)
+    let fy = Double(m.columns.1.y)
+    let cx = Double(m.columns.2.x)
+    let cy = Double(m.columns.2.y)
+    guard fx > 1, fy > 1 else { return nil }
+    return (fx, fy, cx, cy)
   }
 
-  private func appendFrameJsonl(number: Int, sampleBuffer: CMSampleBuffer) {
+  private func appendFrameJsonl(
+    number: Int,
+    wideSample: CMSampleBuffer,
+    secondSample: CMSampleBuffer?,
+    isDepthGray: Bool,
+    depthCalibration: AVCameraCalibrationData?
+  ) {
     guard let first = firstVideoPts else { return }
-    let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    let pts = CMSampleBufferGetPresentationTimeStamp(wideSample)
     let rel = CMTimeSubtract(pts, first)
     let t = CMTimeGetSeconds(rel)
+
+    var frame0: [String: Any] = [
+      "cameraInd": 0,
+      "colorFormat": "rgb",
+    ]
+    if let cal = Self.intrinsicCalibration(from: wideSample) {
+      lastFocalLengthX = cal.fx
+      lastFocalLengthY = cal.fy
+      lastPrincipalPointX = cal.cx
+      lastPrincipalPointY = cal.cy
+      didUpdateIntrinsicsFromSample = true
+      frame0["calibration"] = [
+        "focalLengthX": cal.fx,
+        "focalLengthY": cal.fy,
+        "principalPointX": cal.cx,
+        "principalPointY": cal.cy,
+      ]
+    }
+    frame0["exposureTimeSeconds"] = lockedExposureDurationSeconds
+
+    var framesArray: [[String: Any]] = [frame0]
+
+    if let sb2 = secondSample {
+      var frame1: [String: Any] = [
+        "cameraInd": 1,
+        "time": 0,
+        "aligned": true,
+      ]
+      if isDepthGray {
+        frame1["colorFormat"] = "gray"
+        frame1["depthScale"] = jsonDepthScale
+        if didUpdateSecondIntrinsics {
+          frame1["calibration"] = [
+            "focalLengthX": lastSecondFocalLengthX,
+            "focalLengthY": lastSecondFocalLengthY,
+            "principalPointX": lastSecondPrincipalPointX,
+            "principalPointY": lastSecondPrincipalPointY,
+          ]
+        } else if let cal = Self.intrinsicCalibration(from: wideSample) {
+          frame1["calibration"] = [
+            "focalLengthX": cal.fx,
+            "focalLengthY": cal.fy,
+            "principalPointX": cal.cx,
+            "principalPointY": cal.cy,
+          ]
+        }
+      } else {
+        frame1["colorFormat"] = "rgb"
+        if let c2 = Self.intrinsicCalibration(from: sb2) {
+          lastSecondFocalLengthX = c2.fx
+          lastSecondFocalLengthY = c2.fy
+          lastSecondPrincipalPointX = c2.cx
+          lastSecondPrincipalPointY = c2.cy
+          didUpdateSecondIntrinsics = true
+          frame1["calibration"] = [
+            "focalLengthX": c2.fx,
+            "focalLengthY": c2.fy,
+            "principalPointX": c2.cx,
+            "principalPointY": c2.cy,
+          ]
+        }
+        frame1["exposureTimeSeconds"] = lockedExposureDurationSeconds
+      }
+      framesArray.append(frame1)
+    }
 
     enqueueJsonl(
       time: t,
@@ -345,9 +814,7 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       object: [
         "number": number,
         "time": t,
-        "frames": [
-          ["cameraInd": 0] as [String: Any],
-        ],
+        "frames": framesArray,
       ]
     )
   }
@@ -356,7 +823,6 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     pendingJsonl.append(PendingJsonlLine(time: time, kind: kind, object: object))
   }
 
-  /// P1：整段会话缓冲于内存，停止时按 `time` 升序、同类稳定次序一次写入（减少录制中频繁刷盘）。
   private func writeSortedJsonlToDisk() {
     guard !pendingJsonl.isEmpty else { return }
     let sorted = pendingJsonl.sorted { a, b in
@@ -390,12 +856,22 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
   private func performStop(completion: @escaping (Result<URL, Error>) -> Void) {
     isStopping = true
     motionManager.stopDeviceMotionUpdates()
+    motionManager.stopMagnetometerUpdates()
+
+    dataOutputSynchronizer?.setDelegate(nil, queue: nil)
+    dataOutputSynchronizer = nil
 
     videoOutput?.setSampleBufferDelegate(nil, queue: nil)
+    secondVideoOutput?.setSampleBufferDelegate(nil, queue: nil)
     captureSession?.stopRunning()
     captureSession = nil
     videoOutput = nil
+    secondVideoOutput = nil
+    depthOutput = nil
     captureDevice = nil
+    secondCaptureDevice = nil
+    pendingWideBuffers.removeAll()
+    ultraBufferQueue.removeAll()
 
     writeSortedJsonlToDisk()
 
@@ -403,6 +879,8 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       guard let self = self else { return }
       self.assetWriter = nil
       self.videoInput = nil
+      self.assetWriter2 = nil
+      self.videoInput2 = nil
 
       self.writeCalibrationJson()
       self.writeMetadataJson()
@@ -410,6 +888,25 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
       DispatchQueue.main.async {
         UIApplication.shared.isIdleTimerDisabled = false
         completion(.success(self.outputDirectory))
+      }
+    }
+
+    let finishOne: () -> Void = { [weak self] in
+      guard let self = self else { return }
+      if let input2 = self.videoInput2, let w2 = self.assetWriter2, self.didStartWriter {
+        input2.markAsFinished()
+        w2.finishWriting { [weak self] in
+          guard let self = self else { return }
+          self.syncQueue.async {
+            if w2.status == .failed {
+              self.assetWriter2 = nil
+              self.videoInput2 = nil
+            }
+            finalizeSuccess()
+          }
+        }
+      } else {
+        finalizeSuccess()
       }
     }
 
@@ -421,6 +918,8 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
           if writer.status == .failed {
             self.assetWriter = nil
             self.videoInput = nil
+            self.assetWriter2 = nil
+            self.videoInput2 = nil
             let err = writer.error ?? SlamRecordingError.writerSetupFailed("unknown")
             DispatchQueue.main.async {
               UIApplication.shared.isIdleTimerDisabled = false
@@ -428,41 +927,210 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
             }
             return
           }
-          finalizeSuccess()
+          finishOne()
         }
       }
     } else {
       assetWriter = nil
       videoInput = nil
+      assetWriter2 = nil
+      videoInput2 = nil
       finalizeSuccess()
     }
+  }
+
+  private func applyFocusExposureLockIfPossible() {
+    guard let device = captureDevice else { return }
+    let lensPosition = min(max(device.lensPosition, 0), 1)
+
+    do {
+      try device.lockForConfiguration()
+      if device.isFocusPointOfInterestSupported {
+        device.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+      }
+      if device.isExposurePointOfInterestSupported {
+        device.exposurePointOfInterest = CGPoint(x: 0.5, y: 0.5)
+      }
+      device.unlockForConfiguration()
+    } catch {
+      return
+    }
+
+    device.setFocusModeLocked(lensPosition: lensPosition) { [weak self] _ in
+      guard let device = self?.captureDevice else { return }
+      do {
+        try device.lockForConfiguration()
+        guard device.isExposureModeSupported(.custom) else {
+          device.unlockForConfiguration()
+          return
+        }
+        let duration = device.exposureDuration
+        let iso = min(max(device.iso, device.activeFormat.minISO), device.activeFormat.maxISO)
+        self?.syncQueue.async {
+          self?.lockedExposureDurationSeconds = CMTimeGetSeconds(duration)
+        }
+        device.setExposureModeCustom(duration: duration, iso: iso) { [weak self] _ in
+          guard let device = self?.captureDevice else { return }
+          self?.syncQueue.async {
+            self?.lockedExposureDurationSeconds = CMTimeGetSeconds(device.exposureDuration)
+          }
+          do {
+            try device.lockForConfiguration()
+            if device.isWhiteBalanceModeSupported(.locked) {
+              device.whiteBalanceMode = .locked
+            }
+            device.unlockForConfiguration()
+          } catch {
+            try? device.unlockForConfiguration()
+          }
+        }
+      } catch {
+        try? device.unlockForConfiguration()
+      }
+    }
+  }
+
+  private func startMotion() {
+    guard motionManager.isDeviceMotionAvailable else { return }
+    motionManager.deviceMotionUpdateInterval = 1.0 / 100.0
+    motionManager.startDeviceMotionUpdates(using: .xArbitraryZVertical, to: motionQueue) { [weak self] motion, _ in
+      guard let self = self, let m = motion else { return }
+      self.syncQueue.async {
+        self.appendImuLines(from: m)
+      }
+    }
+
+    if motionManager.isMagnetometerAvailable {
+      motionManager.magnetometerUpdateInterval = 1.0 / 60.0
+      motionManager.startMagnetometerUpdates(to: magnetometerQueue) { [weak self] data, _ in
+        guard let self = self, let d = data else { return }
+        self.syncQueue.async {
+          self.appendMagnetometerLine(d)
+        }
+      }
+    }
+  }
+
+  private func appendImuLines(from motion: CMDeviceMotion) {
+    guard !isStopping, didStartWriter else { return }
+    let t = CACurrentMediaTime() - timeOriginMedia
+    let gx = motion.rotationRate.x
+    let gy = motion.rotationRate.y
+    let gz = motion.rotationRate.z
+    let ax = motion.gravity.x + motion.userAcceleration.x
+    let ay = motion.gravity.y + motion.userAcceleration.y
+    let az = motion.gravity.z + motion.userAcceleration.z
+
+    enqueueJsonl(
+      time: t,
+      kind: .gyroscope,
+      object: [
+        "time": t,
+        "sensor": [
+          "type": "gyroscope",
+          "values": [gx, gy, gz],
+        ],
+      ]
+    )
+    enqueueJsonl(
+      time: t,
+      kind: .accelerometer,
+      object: [
+        "time": t,
+        "sensor": [
+          "type": "accelerometer",
+          "values": [ax, ay, az],
+        ],
+      ]
+    )
+  }
+
+  private func appendMagnetometerLine(_ data: CMMagnetometerData) {
+    guard !isStopping, didStartWriter else { return }
+    let t = CACurrentMediaTime() - timeOriginMedia
+    let f = data.magneticField
+    enqueueJsonl(
+      time: t,
+      kind: .magnetometer,
+      object: [
+        "time": t,
+        "sensor": [
+          "type": "magnetometer",
+          "values": [f.x, f.y, f.z],
+        ],
+      ]
+    )
   }
 
   private func writeCalibrationJson() {
     let w = videoWidth > 0 ? videoWidth : 1920
     let h = videoHeight > 0 ? videoHeight : 1080
-    let fx = Double(w) * 0.72
-    let fy = fx
-    let cx = Double(w) / 2.0
-    let cy = Double(h) / 2.0
 
-    let camera: [String: Any] = [
+    let fx1: Double
+    let fy1: Double
+    let cx1: Double
+    let cy1: Double
+    if didUpdateIntrinsicsFromSample, lastFocalLengthX > 1, lastFocalLengthY > 1 {
+      fx1 = lastFocalLengthX
+      fy1 = lastFocalLengthY
+      cx1 = lastPrincipalPointX
+      cy1 = lastPrincipalPointY
+    } else {
+      fx1 = Double(w) * 0.72
+      fy1 = fx1
+      cx1 = Double(w) / 2.0
+      cy1 = Double(h) / 2.0
+    }
+
+    let imuI: [[Double]] = [
+      [1, 0, 0, 0],
+      [0, 1, 0, 0],
+      [0, 0, 1, 0],
+      [0, 0, 0, 1],
+    ]
+
+    var cam1: [String: Any] = [
       "model": "pinhole",
-      "focalLengthX": fx,
-      "focalLengthY": fy,
-      "principalPointX": cx,
-      "principalPointY": cy,
+      "focalLengthX": fx1,
+      "focalLengthY": fy1,
+      "principalPointX": cx1,
+      "principalPointY": cy1,
       "imageWidth": w,
       "imageHeight": h,
-      "imuToCamera": [
-        [1, 0, 0, 0],
-        [0, 1, 0, 0],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1],
-      ],
+      "imuToCamera": imuI,
     ]
-    let root: [String: Any] = ["cameras": [camera]]
-    writeJsonFile(name: "calibration.json", object: root)
+
+    var cameras: [[String: Any]] = [cam1]
+
+    if captureMode != .singleWide, videoWidth2 > 0, videoHeight2 > 0 {
+      let w2 = videoWidth2
+      let h2 = videoHeight2
+      let fx2 = didUpdateSecondIntrinsics && lastSecondFocalLengthX > 1 ? lastSecondFocalLengthX : fx1
+      let fy2 = didUpdateSecondIntrinsics && lastSecondFocalLengthY > 1 ? lastSecondFocalLengthY : fy1
+      let cx2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointX : Double(w2) / 2.0
+      let cy2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointY : Double(h2) / 2.0
+      let imu2: [[Double]] = captureMode == .depthAndWide
+        ? imuI
+        : [
+          [1, 0, 0, 0],
+          [0, 1, 0, 0],
+          [0, 0, 1, 0],
+          [0, 0, 0, 1],
+        ]
+      let cam2: [String: Any] = [
+        "model": "pinhole",
+        "focalLengthX": fx2,
+        "focalLengthY": fy2,
+        "principalPointX": cx2,
+        "principalPointY": cy2,
+        "imageWidth": w2,
+        "imageHeight": h2,
+        "imuToCamera": imu2,
+      ]
+      cameras.append(cam2)
+    }
+
+    writeJsonFile(name: "calibration.json", object: ["cameras": cameras])
   }
 
   private func writeMetadataJson() {
@@ -470,12 +1138,20 @@ final class SlamRecordingSession: NSObject, AVCaptureVideoDataOutputSampleBuffer
     var root: [String: Any] = [
       "device_model": model,
       "platform": "ios",
-      /// `imuTemperature`：Core Motion 无公开 API；不写入伪造数据（P1）。
       "imu_temperature_status": "unavailable_no_public_api_ios",
+      "intrinsics_source": didUpdateIntrinsicsFromSample ? "cmsamplebuffer_attachment" : "heuristic_fallback",
+      "dual_capture_mode": captureMode == .depthAndWide ? "depth_gray_data2"
+        : captureMode == .multiCamRgb ? "wide_ultrawide_rgb_data2" : "single_wide",
     ]
     root["p1"] = [
       "jsonl_sorted_by_time": true,
       "focus_exposure_locked_after_delay_s": 0.2,
+    ] as [String: Any]
+    root["spectacular_sample_alignment"] = [
+      "magnetometer_jsonl": true,
+      "per_frame_calibration_rgb": true,
+      "dual_camera_data2": captureMode != .singleWide,
+      "imu_temperature_jsonl": false,
     ] as [String: Any]
     writeJsonFile(name: "metadata.json", object: root)
   }
