@@ -1,4 +1,5 @@
 import AVFoundation
+import CoreImage
 import CoreMotion
 import CoreVideo
 import Darwin
@@ -66,6 +67,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   private let videoQueue = DispatchQueue(label: "com.binwu.reconstruction.spatial_data_recorder.video")
   private let motionQueue = OperationQueue()
   private let magnetometerQueue = OperationQueue()
+  private let ciContext = CIContext(options: nil)
 
   private var captureSession: AVCaptureSession?
   private var captureDevice: AVCaptureDevice?
@@ -85,6 +87,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   private let motionManager = CMMotionManager()
 
   private var captureMode: DualCaptureMode = .singleWide
+  private var shouldExportDepthPngFrames = false
 
   private var timeOriginMedia: CFTimeInterval = 0
   private var firstVideoPts: CMTime?
@@ -107,6 +110,10 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   private var lastSecondPrincipalPointX: Double = 0
   private var lastSecondPrincipalPointY: Double = 0
   private var didUpdateSecondIntrinsics = false
+  private var lastDepthToWideExtrinsic: [[Double]]?
+
+  private var lastPrimaryImuToCameraSource = "capture_convention_back_camera_axes"
+  private var lastSecondaryImuToCameraSource = "not_applicable_single_camera"
 
   /// MultiCam：待配对的超广角缓冲
   private var ultraBufferQueue: [CMSampleBuffer] = []
@@ -117,6 +124,10 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
 
   /// 样例与 Spectacular 常用：米/灰度量化（仅作语义对齐；实际深度以 Float 录制为准）
   private let jsonDepthScale: Double = 0.001
+
+  private var frames2DirectoryURL: URL {
+    outputDirectory.appendingPathComponent("frames2", isDirectory: true)
+  }
 
   init(outputDirectory: URL) {
     self.outputDirectory = outputDirectory
@@ -159,6 +170,12 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       DispatchQueue.main.async { completion(SlamRecordingError.captureSetupFailed) }
       return
     }
+
+    shouldExportDepthPngFrames = captureMode == .depthAndWide
+    lastDepthToWideExtrinsic = nil
+    lastPrimaryImuToCameraSource = "capture_convention_back_camera_axes"
+    lastSecondaryImuToCameraSource = "not_applicable_single_camera"
+    prepareFrames2DirectoryIfNeeded()
 
     captureSession?.startRunning()
 
@@ -355,6 +372,16 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     return true
   }
 
+  private func prepareFrames2DirectoryIfNeeded() {
+    let fm = FileManager.default
+    if shouldExportDepthPngFrames {
+      try? fm.removeItem(at: frames2DirectoryURL)
+      try? fm.createDirectory(at: frames2DirectoryURL, withIntermediateDirectories: true)
+    } else {
+      try? fm.removeItem(at: frames2DirectoryURL)
+    }
+  }
+
   // MARK: - AVCaptureDataOutputSynchronizerDelegate（深度 + 广角）
 
   func dataOutputSynchronizer(
@@ -401,6 +428,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       lastSecondPrincipalPointX = cx
       lastSecondPrincipalPointY = cy
       didUpdateSecondIntrinsics = fx > 1 && fy > 1
+      lastDepthToWideExtrinsic = Self.depthToWideExtrinsicRows(cal)
     }
 
     guard let sb2 = Self.makeSampleBuffer(from: grayBuffer, pts: CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
@@ -606,6 +634,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
         isDepthGray: captureMode == .depthAndWide,
         depthCalibration: depthCalibration
       )
+      exportDepthFramePngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
       frameIndex += 1
       input.append(sampleBuffer)
       if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
@@ -621,11 +650,35 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       isDepthGray: captureMode == .depthAndWide,
       depthCalibration: depthCalibration
     )
+    exportDepthFramePngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
     frameIndex += 1
     input.append(sampleBuffer)
     if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
       i2.append(sb2)
     }
+  }
+
+  private func exportDepthFramePngIfNeeded(secondSample: CMSampleBuffer?, frameNumber: Int) {
+    guard shouldExportDepthPngFrames,
+          let sb2 = secondSample,
+          let pixelBuffer = CMSampleBufferGetImageBuffer(sb2)
+    else {
+      return
+    }
+
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+      return
+    }
+
+    let image = UIImage(cgImage: cgImage)
+    guard let data = image.pngData() else {
+      return
+    }
+
+    let fileName = String(format: "%08d.png", frameNumber)
+    let url = frames2DirectoryURL.appendingPathComponent(fileName)
+    try? data.write(to: url, options: [.atomic])
   }
 
   private func startWritersIfNeeded(with sampleBuffer: CMSampleBuffer, second: CMSampleBuffer?) -> Bool {
@@ -731,6 +784,68 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     return (fx, fy, cx, cy)
   }
 
+  /// 对齐 Spectacular 常见输出：将 iOS 设备运动坐标轴映射到相机坐标轴。
+  private static func captureConventionImuToCameraMatrix() -> [[Double]] {
+    [
+      [0, -1, 0, 0],
+      [-1, 0, 0, 0],
+      [0, 0, -1, 0],
+      [0, 0, 0, 1],
+    ]
+  }
+
+  /// AVCameraCalibrationData.extrinsicMatrix（3x4）扩展为 4x4 齐次矩阵。
+  private static func depthToWideExtrinsicRows(_ calibration: AVCameraCalibrationData) -> [[Double]] {
+    let e = calibration.extrinsicMatrix
+    return [
+      [Double(e.columns.0.x), Double(e.columns.1.x), Double(e.columns.2.x), Double(e.columns.3.x)],
+      [Double(e.columns.0.y), Double(e.columns.1.y), Double(e.columns.2.y), Double(e.columns.3.y)],
+      [Double(e.columns.0.z), Double(e.columns.1.z), Double(e.columns.2.z), Double(e.columns.3.z)],
+      [0, 0, 0, 1],
+    ]
+  }
+
+  private static func multiply4x4(_ left: [[Double]], _ right: [[Double]]) -> [[Double]] {
+    var out = Array(repeating: Array(repeating: 0.0, count: 4), count: 4)
+    for r in 0..<4 {
+      for c in 0..<4 {
+        var v = 0.0
+        for k in 0..<4 {
+          v += left[r][k] * right[k][c]
+        }
+        out[r][c] = v
+      }
+    }
+    return out
+  }
+
+  /// 针对旋转+平移的刚体变换求逆。
+  private static func invertRigid4x4(_ matrix: [[Double]]) -> [[Double]]? {
+    guard matrix.count == 4, matrix.allSatisfy({ $0.count == 4 }) else {
+      return nil
+    }
+
+    let r00 = matrix[0][0], r01 = matrix[0][1], r02 = matrix[0][2]
+    let r10 = matrix[1][0], r11 = matrix[1][1], r12 = matrix[1][2]
+    let r20 = matrix[2][0], r21 = matrix[2][1], r22 = matrix[2][2]
+    let tx = matrix[0][3], ty = matrix[1][3], tz = matrix[2][3]
+
+    let rt00 = r00, rt01 = r10, rt02 = r20
+    let rt10 = r01, rt11 = r11, rt12 = r21
+    let rt20 = r02, rt21 = r12, rt22 = r22
+
+    let itx = -(rt00 * tx + rt01 * ty + rt02 * tz)
+    let ity = -(rt10 * tx + rt11 * ty + rt12 * tz)
+    let itz = -(rt20 * tx + rt21 * ty + rt22 * tz)
+
+    return [
+      [rt00, rt01, rt02, itx],
+      [rt10, rt11, rt12, ity],
+      [rt20, rt21, rt22, itz],
+      [0, 0, 0, 1],
+    ]
+  }
+
   private func appendFrameJsonl(
     number: Int,
     wideSample: CMSampleBuffer,
@@ -741,7 +856,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     guard let first = firstVideoPts else { return }
     let pts = CMSampleBufferGetPresentationTimeStamp(wideSample)
     let rel = CMTimeSubtract(pts, first)
-    let t = CMTimeGetSeconds(rel)
+    let t = timeOriginMedia + CMTimeGetSeconds(rel)
 
     var frame0: [String: Any] = [
       "cameraInd": 0,
@@ -1013,7 +1128,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
 
   private func appendImuLines(from motion: CMDeviceMotion) {
     guard !isStopping, didStartWriter else { return }
-    let t = CACurrentMediaTime() - timeOriginMedia
+    let t = CACurrentMediaTime()
     let gx = motion.rotationRate.x
     let gy = motion.rotationRate.y
     let gz = motion.rotationRate.z
@@ -1047,7 +1162,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
 
   private func appendMagnetometerLine(_ data: CMMagnetometerData) {
     guard !isStopping, didStartWriter else { return }
-    let t = CACurrentMediaTime() - timeOriginMedia
+    let t = CACurrentMediaTime()
     let f = data.magneticField
     enqueueJsonl(
       time: t,
@@ -1082,12 +1197,9 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       cy1 = Double(h) / 2.0
     }
 
-    let imuI: [[Double]] = [
-      [1, 0, 0, 0],
-      [0, 1, 0, 0],
-      [0, 0, 1, 0],
-      [0, 0, 0, 1],
-    ]
+    let imuI = Self.captureConventionImuToCameraMatrix()
+    let primaryImuSource = "capture_convention_back_camera_axes"
+    var secondaryImuSource = "not_applicable_single_camera"
 
     var cam1: [String: Any] = [
       "model": "pinhole",
@@ -1109,14 +1221,16 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       let fy2 = didUpdateSecondIntrinsics && lastSecondFocalLengthY > 1 ? lastSecondFocalLengthY : fy1
       let cx2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointX : Double(w2) / 2.0
       let cy2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointY : Double(h2) / 2.0
-      let imu2: [[Double]] = captureMode == .depthAndWide
-        ? imuI
-        : [
-          [1, 0, 0, 0],
-          [0, 1, 0, 0],
-          [0, 0, 1, 0],
-          [0, 0, 0, 1],
-        ]
+      var imu2 = imuI
+      if captureMode == .depthAndWide,
+         let depthToWide = lastDepthToWideExtrinsic,
+         let wideToDepth = Self.invertRigid4x4(depthToWide)
+      {
+        imu2 = Self.multiply4x4(wideToDepth, imuI)
+        secondaryImuSource = "depth_calibration_extrinsic_composed"
+      } else {
+        secondaryImuSource = "capture_convention_copy_primary"
+      }
       let cam2: [String: Any] = [
         "model": "pinhole",
         "focalLengthX": fx2,
@@ -1129,6 +1243,9 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       ]
       cameras.append(cam2)
     }
+
+    lastPrimaryImuToCameraSource = primaryImuSource
+    lastSecondaryImuToCameraSource = secondaryImuSource
 
     writeJsonFile(name: "calibration.json", object: ["cameras": cameras])
   }
@@ -1151,7 +1268,13 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       "magnetometer_jsonl": true,
       "per_frame_calibration_rgb": true,
       "dual_camera_data2": captureMode != .singleWide,
+      "frames2_png_sequence": shouldExportDepthPngFrames,
       "imu_temperature_jsonl": false,
+    ] as [String: Any]
+    root["calibration_capture_sources"] = [
+      "imu_to_camera_primary": lastPrimaryImuToCameraSource,
+      "imu_to_camera_secondary": lastSecondaryImuToCameraSource,
+      "depth_to_wide_extrinsic_available": lastDepthToWideExtrinsic != nil,
     ] as [String: Any]
     writeJsonFile(name: "metadata.json", object: root)
   }
