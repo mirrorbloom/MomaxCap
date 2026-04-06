@@ -5,6 +5,9 @@ import 'package:permission_handler/permission_handler.dart';
 
 import '../../core/recording/session_directory.dart';
 import '../../core/recorder/recorder_providers.dart';
+import '../../core/upload/models/upload_enqueue_result.dart';
+import '../../core/upload/models/upload_task.dart';
+import '../../core/upload/upload_providers.dart';
 import 'recordings_browser_page.dart';
 import 'recorder_live_preview.dart';
 
@@ -116,10 +119,23 @@ class _HomePageState extends ConsumerState<HomePage> {
       _busy = true;
     });
     try {
-      await ref.read(recorderPlatformProvider).stopRecording();
+      final sessionPath = await ref
+          .read(recorderPlatformProvider)
+          .stopRecording();
+
+      var uploadMessage = '上传任务状态未知。';
+      try {
+        final enqueueResult = await ref
+            .read(uploadQueueControllerProvider.notifier)
+            .enqueueSession(sessionPath);
+        uploadMessage = _enqueueMessage(enqueueResult);
+      } catch (e) {
+        uploadMessage = '录制已完成，但加入上传队列失败：$e';
+      }
+
       await _refreshStatus();
       if (mounted) {
-        _toast('已停止录制');
+        _toast('已停止录制，$uploadMessage');
       }
     } catch (e) {
       _toast('停止录制失败：$e');
@@ -172,6 +188,7 @@ class _HomePageState extends ConsumerState<HomePage> {
   Widget build(BuildContext context) {
     final recording = _status?['recording'] == true;
     final bottomInset = MediaQuery.of(context).padding.bottom;
+    final latestUploadTask = ref.watch(latestUploadTaskProvider);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -193,6 +210,22 @@ class _HomePageState extends ConsumerState<HomePage> {
               const Align(
                 alignment: Alignment.topCenter,
                 child: LinearProgressIndicator(minHeight: 2),
+              ),
+            if (latestUploadTask != null)
+              Positioned(
+                left: 12,
+                right: 12,
+                top: 10,
+                child: _UploadStatusBanner(
+                  task: latestUploadTask,
+                  onRetry: latestUploadTask.status == UploadTaskStatus.failed
+                      ? () {
+                          ref
+                              .read(uploadQueueControllerProvider.notifier)
+                              .retryTask(latestUploadTask.id);
+                        }
+                      : null,
+                ),
               ),
             Positioned(
               left: 16,
@@ -274,6 +307,118 @@ class _HomePageState extends ConsumerState<HomePage> {
         return 'Linux';
       case TargetPlatform.fuchsia:
         return 'Fuchsia';
+    }
+  }
+
+  String _enqueueMessage(UploadEnqueueResult result) {
+    switch (result) {
+      case UploadEnqueueResult.created:
+        return '上传任务已加入队列。';
+      case UploadEnqueueResult.requeued:
+        return '上传任务已重新加入队列。';
+      case UploadEnqueueResult.alreadyQueued:
+        return '上传任务已在队列中。';
+      case UploadEnqueueResult.alreadySuccess:
+        return '该会话已上传成功。';
+    }
+  }
+}
+
+class _UploadStatusBanner extends StatelessWidget {
+  const _UploadStatusBanner({required this.task, required this.onRetry});
+
+  final UploadTask task;
+  final VoidCallback? onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final message = _messageForTask(task);
+    final progress = task.progress.fraction;
+
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Row(
+              children: [
+                Icon(
+                  _iconForStatus(task.status),
+                  color: Colors.white,
+                  size: 18,
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    message,
+                    style: const TextStyle(color: Colors.white, fontSize: 12),
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                  ),
+                ),
+                if (onRetry != null)
+                  TextButton(onPressed: onRetry, child: const Text('重试')),
+              ],
+            ),
+            if (task.status == UploadTaskStatus.uploading)
+              Padding(
+                padding: const EdgeInsets.only(top: 8),
+                child: LinearProgressIndicator(
+                  value: progress > 0 ? progress : null,
+                  minHeight: 4,
+                ),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  String _messageForTask(UploadTask task) {
+    switch (task.status) {
+      case UploadTaskStatus.waiting:
+        return '等待上传：${task.sessionName}';
+      case UploadTaskStatus.compressing:
+        return '正在压缩：${task.sessionName}';
+      case UploadTaskStatus.uploading:
+        final percent = (task.progress.fraction * 100).toStringAsFixed(1);
+        return '正在上传：$percent%';
+      case UploadTaskStatus.retrying:
+        return '上传失败，等待重试（第 ${task.attempt} 次）';
+      case UploadTaskStatus.success:
+        return '上传成功：${task.sessionName}';
+      case UploadTaskStatus.failed:
+        final failure = task.failureMessage;
+        if (failure == null || failure.isEmpty) {
+          return '上传失败：${task.sessionName}';
+        }
+        return '上传失败：$failure';
+      case UploadTaskStatus.cancelled:
+        return '上传已取消：${task.sessionName}';
+    }
+  }
+
+  IconData _iconForStatus(UploadTaskStatus status) {
+    switch (status) {
+      case UploadTaskStatus.waiting:
+      case UploadTaskStatus.compressing:
+      case UploadTaskStatus.retrying:
+        return Icons.schedule;
+      case UploadTaskStatus.uploading:
+        return Icons.cloud_upload;
+      case UploadTaskStatus.success:
+        return Icons.check_circle_outline;
+      case UploadTaskStatus.failed:
+        return Icons.error_outline;
+      case UploadTaskStatus.cancelled:
+        return Icons.cancel_outlined;
     }
   }
 }
