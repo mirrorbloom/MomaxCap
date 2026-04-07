@@ -15,6 +15,13 @@ enum SlamRecordingError: LocalizedError {
   case writerSetupFailed(String)
   case alreadyRecording
 
+  static func wrapWriterError(_ error: Error?) -> SlamRecordingError {
+    guard let nsError = error as NSError? else {
+      return .writerSetupFailed("unknown")
+    }
+    return .writerSetupFailed("domain=\(nsError.domain) code=\(nsError.code) desc=\(nsError.localizedDescription)")
+  }
+
   var errorDescription: String? {
     switch self {
     case .simulatorNotSupported:
@@ -125,6 +132,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
 
   private var isStopping = false
   private var didStartWriter = false
+  private var lastPrimaryWrittenPts: CMTime?
+  private var lastSecondaryWrittenPts: CMTime?
 
   /// 样例与 Spectacular 常用：米/灰度量化（仅作语义对齐；实际深度以 Float 录制为准）
   private let jsonDepthScale: Double = 0.001
@@ -183,6 +192,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     lastDepthToWideExtrinsic = nil
     lastPrimaryImuToCameraSource = "capture_convention_back_camera_axes"
     lastSecondaryImuToCameraSource = "not_applicable_single_camera"
+    lastPrimaryWrittenPts = nil
+    lastSecondaryWrittenPts = nil
     prepareFrames2DirectoryIfNeeded()
 
     captureSession?.startRunning()
@@ -727,6 +738,12 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   ) {
     guard !isStopping else { return }
 
+    guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+    let primaryPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if let lastPts = lastPrimaryWrittenPts, CMTimeCompare(primaryPts, lastPts) <= 0 {
+      return
+    }
+
     if assetWriter == nil {
       guard startWritersIfNeeded(with: sampleBuffer, second: secondSample) else { return }
     }
@@ -747,12 +764,11 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     if !didStartWriter {
-      let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-      writer.startSession(atSourceTime: pts)
+      writer.startSession(atSourceTime: primaryPts)
       if hasSecond, let w2 = assetWriter2 {
-        w2.startSession(atSourceTime: pts)
+        w2.startSession(atSourceTime: primaryPts)
       }
-      firstVideoPts = pts
+      firstVideoPts = primaryPts
       timeOriginMedia = CACurrentMediaTime()
       startMotion()
       didStartWriter = true
@@ -765,9 +781,14 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       )
       exportFrames2PngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
       frameIndex += 1
-      input.append(sampleBuffer)
+      if input.append(sampleBuffer) {
+        lastPrimaryWrittenPts = primaryPts
+      }
       if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
-        i2.append(sb2)
+        let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
+        if i2.append(sb2ToAppend) {
+          lastSecondaryWrittenPts = primaryPts
+        }
       }
       return
     }
@@ -781,10 +802,65 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     )
     exportFrames2PngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
     frameIndex += 1
-    input.append(sampleBuffer)
-    if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
-      i2.append(sb2)
+    if input.append(sampleBuffer) {
+      lastPrimaryWrittenPts = primaryPts
     }
+    if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+      let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
+      if i2.append(sb2ToAppend) {
+        lastSecondaryWrittenPts = primaryPts
+      }
+    }
+  }
+
+  private static func retimeSampleBufferIfNeeded(_ sampleBuffer: CMSampleBuffer, to pts: CMTime) -> CMSampleBuffer? {
+    let currentPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+    if CMTimeCompare(currentPts, pts) == 0 {
+      return sampleBuffer
+    }
+
+    var timingCount = 0
+    guard CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount) == noErr,
+          timingCount > 0
+    else {
+      return nil
+    }
+
+    var timings = Array(
+      repeating: CMSampleTimingInfo(
+        duration: .invalid,
+        presentationTimeStamp: .invalid,
+        decodeTimeStamp: .invalid
+      ),
+      count: timingCount
+    )
+
+    guard CMSampleBufferGetSampleTimingInfoArray(
+      sampleBuffer,
+      entryCount: timingCount,
+      arrayToFill: &timings,
+      entriesNeededOut: &timingCount
+    ) == noErr
+    else {
+      return nil
+    }
+
+    for i in 0..<timings.count {
+      timings[i].presentationTimeStamp = pts
+      timings[i].decodeTimeStamp = .invalid
+    }
+
+    var retimed: CMSampleBuffer?
+    let status = CMSampleBufferCreateCopyWithNewTiming(
+      allocator: kCFAllocatorDefault,
+      sampleBuffer: sampleBuffer,
+      sampleTimingEntryCount: timings.count,
+      sampleTimingArray: &timings,
+      sampleBufferOut: &retimed
+    )
+
+    guard status == noErr else { return nil }
+    return retimed
   }
 
   private func exportFrames2PngIfNeeded(secondSample: CMSampleBuffer?, frameNumber: Int) {
@@ -1145,6 +1221,9 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     let finishOne: () -> Void = { [weak self] in
       guard let self = self else { return }
       if let input2 = self.videoInput2, let w2 = self.assetWriter2, self.didStartWriter {
+        if let lastPts2 = self.lastSecondaryWrittenPts {
+          w2.endSession(atSourceTime: lastPts2)
+        }
         input2.markAsFinished()
         w2.finishWriting { [weak self] in
           guard let self = self else { return }
@@ -1162,6 +1241,28 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     if let input = videoInput, let writer = assetWriter, didStartWriter {
+      if let lastPts = lastPrimaryWrittenPts {
+        writer.endSession(atSourceTime: lastPts)
+      }
+
+      if writer.status == .failed {
+        let movieURL = outputDirectory.appendingPathComponent("data.mov")
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: movieURL.path),
+           let size = attrs[.size] as? NSNumber,
+           size.int64Value > 0
+        {
+          finishOne()
+          return
+        }
+
+        let err = SlamRecordingError.wrapWriterError(writer.error)
+        DispatchQueue.main.async {
+          UIApplication.shared.isIdleTimerDisabled = false
+          completion(.failure(err))
+        }
+        return
+      }
+
       input.markAsFinished()
       writer.finishWriting { [weak self] in
         guard let self = self else { return }
@@ -1171,7 +1272,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
             self.videoInput = nil
             self.assetWriter2 = nil
             self.videoInput2 = nil
-            let err = writer.error ?? SlamRecordingError.writerSetupFailed("unknown")
+            let err = SlamRecordingError.wrapWriterError(writer.error)
             DispatchQueue.main.async {
               UIApplication.shared.isIdleTimerDisabled = false
               completion(.failure(err))
