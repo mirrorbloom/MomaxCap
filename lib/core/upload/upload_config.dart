@@ -64,6 +64,59 @@ String _requireEnv(String key) {
   return value;
 }
 
+int _indexOfAny(String value, List<String> candidates) {
+  var index = -1;
+  for (final candidate in candidates) {
+    final candidateIndex = value.indexOf(candidate);
+    if (candidateIndex >= 0 && (index == -1 || candidateIndex < index)) {
+      index = candidateIndex;
+    }
+  }
+  return index;
+}
+
+String _normalizeUploadBaseUrl(String value) {
+  final schemeSeparatorIndex = value.indexOf('://');
+  if (schemeSeparatorIndex <= 0) {
+    return value;
+  }
+
+  final prefix = value.substring(0, schemeSeparatorIndex + 3);
+  final rest = value.substring(schemeSeparatorIndex + 3);
+  if (rest.startsWith('[')) {
+    return value;
+  }
+
+  final authorityEnd = _indexOfAny(rest, const <String>['/', '?', '#']);
+  final authority = authorityEnd == -1 ? rest : rest.substring(0, authorityEnd);
+  final suffix = authorityEnd == -1 ? '' : rest.substring(authorityEnd);
+
+  final userInfoEnd = authority.lastIndexOf('@');
+  final userInfo = userInfoEnd == -1
+      ? ''
+      : authority.substring(0, userInfoEnd + 1);
+  final hostPort = userInfoEnd == -1
+      ? authority
+      : authority.substring(userInfoEnd + 1);
+
+  if (hostPort.startsWith('[')) {
+    return value;
+  }
+
+  final colonCount = ':'.allMatches(hostPort).length;
+  if (colonCount < 2) {
+    return value;
+  }
+
+  final lastColonIndex = hostPort.lastIndexOf(':');
+  final maybePort = hostPort.substring(lastColonIndex + 1);
+  final hasPort = RegExp(r'^\d+$').hasMatch(maybePort);
+  final host = hasPort ? hostPort.substring(0, lastColonIndex) : hostPort;
+  final portPart = hasPort ? ':$maybePort' : '';
+
+  return '$prefix$userInfo[$host]$portPart$suffix';
+}
+
 Duration _durationSecondsEnv(String key, Duration fallback) {
   final raw = dotenv.env[key]?.trim();
   if (raw == null || raw.isEmpty) {
@@ -88,7 +141,18 @@ int _intEnv(String key, int fallback) {
   return parsed;
 }
 
-String _uploadBaseUrlFromEnv() => _requireEnv('UPLOAD_BASE_URL');
+String _uploadBaseUrlFromEnv() {
+  final raw = _requireEnv('UPLOAD_BASE_URL');
+  final normalized = _normalizeUploadBaseUrl(raw);
+  final parsed = Uri.tryParse(normalized);
+
+  if (parsed == null || parsed.scheme.isEmpty || parsed.host.isEmpty) {
+    throw StateError('UPLOAD_BASE_URL 格式无效: $raw');
+  }
+
+  return normalized;
+}
+
 String _uploadPathFromEnv() => _requireEnv('UPLOAD_PATH');
 String _uploadTokenFromEnv() => _requireEnv('UPLOAD_AUTH_TOKEN');
 

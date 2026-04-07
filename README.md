@@ -7,9 +7,13 @@ A new Flutter project.
 Upload settings are read from `.env` at runtime. The app no longer hardcodes
 backend URL or auth token.
 
-1. Copy `.env.example` to `.env`.
+1. Copy `.env-example` to `.env`.
 2. Update `UPLOAD_BASE_URL` and `UPLOAD_AUTH_TOKEN`.
 3. Ensure backend `AUTH_TOKENS` uses the same token value.
+
+If `UPLOAD_BASE_URL` uses an IPv6 literal, wrap host with brackets:
+
+- `http://[240e:3bb:2e71:310::1101]:8080`
 
 Required keys:
 
