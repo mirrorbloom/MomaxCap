@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -21,6 +23,13 @@ class HomePage extends ConsumerStatefulWidget {
 class _HomePageState extends ConsumerState<HomePage> {
   Map<String, dynamic>? _status;
   bool _busy = false;
+  Timer? _recordingTicker;
+  DateTime? _recordingStartedAt;
+
+  Timer? _uploadSuccessHideTimer;
+  String? _autoHideSuccessTaskId;
+  String? _dismissedSuccessTaskId;
+  String? _latestUploadTaskSignature;
 
   bool get _isIos => !kIsWeb && defaultTargetPlatform == TargetPlatform.iOS;
 
@@ -71,10 +80,28 @@ class _HomePageState extends ConsumerState<HomePage> {
         setState(() {
           _status = status;
         });
+        _syncRecordingTicker(recording: status['recording'] == true);
       }
     } catch (e) {
       _toast('刷新状态失败：$e');
     }
+  }
+
+  void _syncRecordingTicker({required bool recording}) {
+    if (!recording) {
+      _recordingStartedAt = null;
+      _recordingTicker?.cancel();
+      _recordingTicker = null;
+      return;
+    }
+
+    _recordingStartedAt ??= DateTime.now();
+    _recordingTicker ??= Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) {
+        return;
+      }
+      setState(() {});
+    });
   }
 
   Future<void> _startRecording() async {
@@ -97,9 +124,6 @@ class _HomePageState extends ConsumerState<HomePage> {
           .read(recorderPlatformProvider)
           .startRecording(outputDir: dir.path);
       await _refreshStatus();
-      if (mounted) {
-        _toast('已开始录制');
-      }
     } catch (e) {
       _toast('开始录制失败：$e');
     } finally {
@@ -169,7 +193,93 @@ class _HomePageState extends ConsumerState<HomePage> {
     if (!mounted) {
       return;
     }
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(msg)));
+    final messenger = ScaffoldMessenger.of(context);
+    messenger.hideCurrentSnackBar();
+    messenger.showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        duration: const Duration(seconds: 2),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.fromLTRB(16, 0, 16, 92),
+      ),
+    );
+  }
+
+  void _syncUploadSuccessBannerAutoHide(UploadTask? latestUploadTask) {
+    if (latestUploadTask == null) {
+      _uploadSuccessHideTimer?.cancel();
+      _uploadSuccessHideTimer = null;
+      _autoHideSuccessTaskId = null;
+      return;
+    }
+
+    if (latestUploadTask.status != UploadTaskStatus.success) {
+      _uploadSuccessHideTimer?.cancel();
+      _uploadSuccessHideTimer = null;
+      _autoHideSuccessTaskId = null;
+      if (_dismissedSuccessTaskId == latestUploadTask.id) {
+        _dismissedSuccessTaskId = null;
+      }
+      return;
+    }
+
+    if (_dismissedSuccessTaskId != null &&
+        _dismissedSuccessTaskId != latestUploadTask.id) {
+      _dismissedSuccessTaskId = null;
+    }
+
+    if (_autoHideSuccessTaskId == latestUploadTask.id) {
+      return;
+    }
+
+    _uploadSuccessHideTimer?.cancel();
+    _autoHideSuccessTaskId = latestUploadTask.id;
+    _uploadSuccessHideTimer = Timer(const Duration(seconds: 4), () {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _dismissedSuccessTaskId = latestUploadTask.id;
+        _autoHideSuccessTaskId = null;
+      });
+    });
+  }
+
+  bool _shouldShowUploadBanner(UploadTask? task) {
+    if (task == null) {
+      return false;
+    }
+    if (task.status != UploadTaskStatus.success) {
+      return true;
+    }
+    return _dismissedSuccessTaskId != task.id;
+  }
+
+  String _recordingElapsedText() {
+    final startedAt = _recordingStartedAt;
+    if (startedAt == null) {
+      return '00:00';
+    }
+
+    final elapsed = DateTime.now().difference(startedAt);
+    final safeElapsed = elapsed.isNegative ? Duration.zero : elapsed;
+    final hours = safeElapsed.inHours;
+    final minutes = safeElapsed.inMinutes % 60;
+    final seconds = safeElapsed.inSeconds % 60;
+
+    if (hours > 0) {
+      return '${_twoDigits(hours)}:${_twoDigits(minutes)}:${_twoDigits(seconds)}';
+    }
+    return '${_twoDigits(minutes)}:${_twoDigits(seconds)}';
+  }
+
+  String _twoDigits(int value) => value.toString().padLeft(2, '0');
+
+  @override
+  void dispose() {
+    _recordingTicker?.cancel();
+    _uploadSuccessHideTimer?.cancel();
+    super.dispose();
   }
 
   @override
@@ -190,6 +300,14 @@ class _HomePageState extends ConsumerState<HomePage> {
     final recording = _status?['recording'] == true;
     final bottomInset = MediaQuery.of(context).padding.bottom;
     final latestUploadTask = ref.watch(latestUploadTaskProvider);
+    final latestTaskSignature = latestUploadTask == null
+        ? null
+        : '${latestUploadTask.id}:${latestUploadTask.status.name}:${latestUploadTask.updatedAt.millisecondsSinceEpoch}';
+    if (latestTaskSignature != _latestUploadTaskSignature) {
+      _latestUploadTaskSignature = latestTaskSignature;
+      _syncUploadSuccessBannerAutoHide(latestUploadTask);
+    }
+    final showUploadBanner = _shouldShowUploadBanner(latestUploadTask);
 
     return Scaffold(
       backgroundColor: Colors.black,
@@ -212,11 +330,22 @@ class _HomePageState extends ConsumerState<HomePage> {
                 alignment: Alignment.topCenter,
                 child: LinearProgressIndicator(minHeight: 2),
               ),
-            if (latestUploadTask != null)
+            if (recording)
+              Positioned(
+                top: 10,
+                left: 0,
+                right: 0,
+                child: Center(
+                  child: _RecordingElapsedBadge(
+                    elapsedText: _recordingElapsedText(),
+                  ),
+                ),
+              ),
+            if (showUploadBanner && latestUploadTask != null)
               Positioned(
                 left: 12,
                 right: 12,
-                top: 10,
+                top: recording ? 52 : 10,
                 child: _UploadStatusBanner(
                   task: latestUploadTask,
                   onRetry: latestUploadTask.status == UploadTaskStatus.failed
@@ -421,5 +550,40 @@ class _UploadStatusBanner extends StatelessWidget {
       case UploadTaskStatus.cancelled:
         return Icons.cancel_outlined;
     }
+  }
+}
+
+class _RecordingElapsedBadge extends StatelessWidget {
+  const _RecordingElapsedBadge({required this.elapsedText});
+
+  final String elapsedText;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.65),
+        borderRadius: BorderRadius.circular(999),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.fiber_manual_record, color: Colors.red, size: 10),
+            const SizedBox(width: 8),
+            Text(
+              elapsedText,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 12,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 }
