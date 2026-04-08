@@ -19,7 +19,23 @@ enum SlamRecordingError: LocalizedError {
     guard let nsError = error as NSError? else {
       return .writerSetupFailed("unknown")
     }
-    return .writerSetupFailed("domain=\(nsError.domain) code=\(nsError.code) desc=\(nsError.localizedDescription)")
+    var details: [String] = [
+      "domain=\(nsError.domain)",
+      "code=\(nsError.code)",
+      "desc=\(nsError.localizedDescription)",
+    ]
+    if let reason = nsError.localizedFailureReason, !reason.isEmpty {
+      details.append("reason=\(reason)")
+    }
+    if let suggestion = nsError.localizedRecoverySuggestion, !suggestion.isEmpty {
+      details.append("suggestion=\(suggestion)")
+    }
+    if let underlying = nsError.userInfo[NSUnderlyingErrorKey] as? NSError {
+      details.append("underlyingDomain=\(underlying.domain)")
+      details.append("underlyingCode=\(underlying.code)")
+      details.append("underlyingDesc=\(underlying.localizedDescription)")
+    }
+    return .writerSetupFailed(details.joined(separator: " "))
   }
 
   var errorDescription: String? {
@@ -1248,7 +1264,10 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     let finishOne: () -> Void = { [weak self] in
       guard let self = self else { return }
       if let input2 = self.videoInput2, let w2 = self.assetWriter2, self.didStartWriter {
-        if let lastPts2 = self.lastSecondaryWrittenPts {
+        if let lastPts2 = self.lastSecondaryWrittenPts,
+           let firstPts = self.firstVideoPts,
+           CMTimeCompare(lastPts2, firstPts) > 0
+        {
           w2.endSession(atSourceTime: lastPts2)
         }
         input2.markAsFinished()
@@ -1282,7 +1301,9 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
         return
       }
 
-      writer.endSession(atSourceTime: lastPts)
+      if let firstPts = firstVideoPts, CMTimeCompare(lastPts, firstPts) > 0 {
+        writer.endSession(atSourceTime: lastPts)
+      }
 
       if writer.status == .failed {
         if hasNonEmptyPrimaryMovie() {
