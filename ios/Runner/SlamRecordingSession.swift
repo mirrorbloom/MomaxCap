@@ -768,10 +768,36 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       if hasSecond, let w2 = assetWriter2 {
         w2.startSession(atSourceTime: primaryPts)
       }
+
+      guard input.append(sampleBuffer) else {
+        writer.cancelWriting()
+        assetWriter2?.cancelWriting()
+        assetWriter = nil
+        videoInput = nil
+        assetWriter2 = nil
+        videoInput2 = nil
+        firstVideoPts = nil
+        didStartWriter = false
+        lastPrimaryWrittenPts = nil
+        lastSecondaryWrittenPts = nil
+        return
+      }
+
+      var appendedSecond = false
+      if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+        let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
+        appendedSecond = i2.append(sb2ToAppend)
+      }
+
       firstVideoPts = primaryPts
       timeOriginMedia = CACurrentMediaTime()
       startMotion()
       didStartWriter = true
+      lastPrimaryWrittenPts = primaryPts
+      if appendedSecond {
+        lastSecondaryWrittenPts = primaryPts
+      }
+
       appendFrameJsonl(
         number: frameIndex,
         wideSample: sampleBuffer,
@@ -781,15 +807,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       )
       exportFrames2PngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
       frameIndex += 1
-      if input.append(sampleBuffer) {
-        lastPrimaryWrittenPts = primaryPts
-      }
-      if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
-        let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
-        if i2.append(sb2ToAppend) {
-          lastSecondaryWrittenPts = primaryPts
-        }
-      }
       return
     }
 
@@ -1251,9 +1268,21 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     if let input = videoInput, let writer = assetWriter, didStartWriter {
-      if let lastPts = lastPrimaryWrittenPts {
-        writer.endSession(atSourceTime: lastPts)
+      guard let lastPts = lastPrimaryWrittenPts else {
+        writer.cancelWriting()
+        assetWriter2?.cancelWriting()
+        assetWriter = nil
+        videoInput = nil
+        assetWriter2 = nil
+        videoInput2 = nil
+        didStartWriter = false
+        firstVideoPts = nil
+        lastSecondaryWrittenPts = nil
+        finalizeSuccess()
+        return
       }
+
+      writer.endSession(atSourceTime: lastPts)
 
       if writer.status == .failed {
         if hasNonEmptyPrimaryMovie() {
