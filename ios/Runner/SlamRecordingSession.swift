@@ -774,10 +774,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     let hasSecond = captureMode != .singleWide && secondSample != nil && assetWriter2 != nil && videoInput2 != nil
-    let secondInputReady = !hasSecond || (videoInput2?.isReadyForMoreMediaData ?? false)
-    guard secondInputReady else {
-      return
-    }
+    let canAppendSecond = hasSecond && (videoInput2?.isReadyForMoreMediaData ?? false)
+    let secondSampleForThisFrame = canAppendSecond ? secondSample : nil
 
     if !didStartWriter {
       writer.startSession(atSourceTime: primaryPts)
@@ -800,7 +798,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       }
 
       var appendedSecond = false
-      if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+      if canAppendSecond, let i2 = videoInput2, let sb2 = secondSampleForThisFrame {
         let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
         appendedSecond = i2.append(sb2ToAppend)
       }
@@ -817,11 +815,11 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       appendFrameJsonl(
         number: frameIndex,
         wideSample: sampleBuffer,
-        secondSample: secondSample,
+        secondSample: secondSampleForThisFrame,
         isDepthGray: captureMode == .depthAndWide,
         depthCalibration: depthCalibration
       )
-      exportFrames2PngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
+      exportFrames2PngIfNeeded(secondSample: secondSampleForThisFrame, frameNumber: frameIndex)
       frameIndex += 1
       return
     }
@@ -829,16 +827,16 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     appendFrameJsonl(
       number: frameIndex,
       wideSample: sampleBuffer,
-      secondSample: secondSample,
+      secondSample: secondSampleForThisFrame,
       isDepthGray: captureMode == .depthAndWide,
       depthCalibration: depthCalibration
     )
-    exportFrames2PngIfNeeded(secondSample: secondSample, frameNumber: frameIndex)
+    exportFrames2PngIfNeeded(secondSample: secondSampleForThisFrame, frameNumber: frameIndex)
     frameIndex += 1
     if input.append(sampleBuffer) {
       lastPrimaryWrittenPts = primaryPts
     }
-    if hasSecond, let i2 = videoInput2, let sb2 = secondSample {
+    if canAppendSecond, let i2 = videoInput2, let sb2 = secondSampleForThisFrame {
       let sb2ToAppend = Self.retimeSampleBufferIfNeeded(sb2, to: primaryPts) ?? sb2
       if i2.append(sb2ToAppend) {
         lastSecondaryWrittenPts = primaryPts
