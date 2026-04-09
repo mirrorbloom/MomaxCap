@@ -12,7 +12,6 @@
 		3B3967161E833CAA004F5970 /* AppFrameworkInfo.plist in Resources */ = {isa = PBXBuildFile; fileRef = 3B3967151E833CAA004F5970 /* AppFrameworkInfo.plist */; };
 		64D78B802A84AB2A0012C7F1 /* CameraPreviewController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64D78B7F2A84AB2A0012C7F1 /* CameraPreviewController.swift */; };
 		74858FAF1ED2DC5600515810 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 74858FAE1ED2DC5600515810 /* AppDelegate.swift */; };
-		B34858FC1ED2DC5600515810 /* RecorderPreviewPlatformView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34858FB1ED2DC5600515810 /* RecorderPreviewPlatformView.swift */; };
 		8B3B87E42F7E6F950072472F /* Pods_RunnerTests.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 7105B93F4570C7E28A9246DF /* Pods_RunnerTests.framework */; };
 		8B3B87E52F7E6F950072472F /* Pods_RunnerTests.framework in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = 7105B93F4570C7E28A9246DF /* Pods_RunnerTests.framework */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		8B3B87E72F7E6FAF0072472F /* Pods_Runner.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 67CCECF3B6D465B7B1E2ED3E /* Pods_Runner.framework */; };
@@ -22,6 +21,7 @@
 		97C147011CF9000F007C117D /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 97C146FF1CF9000F007C117D /* LaunchScreen.storyboard */; };
 		B14858FC1ED2DC5600515810 /* SlamRecordingSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = B14858FB1ED2DC5600515810 /* SlamRecordingSession.swift */; };
 		B24858FC1ED2DC5600515810 /* RecorderFlutterBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = B24858FB1ED2DC5600515810 /* RecorderFlutterBridge.swift */; };
+		B34858FC1ED2DC5600515810 /* RecorderPreviewPlatformView.swift in Sources */ = {isa = PBXBuildFile; fileRef = B34858FB1ED2DC5600515810 /* RecorderPreviewPlatformView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -71,7 +71,6 @@
 		7105B93F4570C7E28A9246DF /* Pods_RunnerTests.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_RunnerTests.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		74858FAD1ED2DC5600515810 /* Runner-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "Runner-Bridging-Header.h"; sourceTree = "<group>"; };
 		74858FAE1ED2DC5600515810 /* AppDelegate.swift */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = sourcecode.swift; path = AppDelegate.swift; sourceTree = "<group>"; };
-		B34858FB1ED2DC5600515810 /* RecorderPreviewPlatformView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderPreviewPlatformView.swift; sourceTree = "<group>"; };
 		7AFA3C8E1D35360C0083082E /* Release.xcconfig */ = {isa = PBXFileReference; lastKnownFileType = text.xcconfig; name = Release.xcconfig; path = Flutter/Release.xcconfig; sourceTree = "<group>"; };
 		7F1511A48EEF63FDD327618E /* Pods-Runner.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.release.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.release.xcconfig"; sourceTree = "<group>"; };
 		802C7C269846C96477F7DE75 /* Pods-RunnerTests.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.release.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.release.xcconfig"; sourceTree = "<group>"; };
@@ -84,6 +83,7 @@
 		97C147021CF9000F007C117D /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		B14858FB1ED2DC5600515810 /* SlamRecordingSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SlamRecordingSession.swift; sourceTree = "<group>"; };
 		B24858FB1ED2DC5600515810 /* RecorderFlutterBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderFlutterBridge.swift; sourceTree = "<group>"; };
+		B34858FB1ED2DC5600515810 /* RecorderPreviewPlatformView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecorderPreviewPlatformView.swift; sourceTree = "<group>"; };
 		B4F6927892FA39E61D2AA065 /* Pods-RunnerTests.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-RunnerTests.debug.xcconfig"; path = "Target Support Files/Pods-RunnerTests/Pods-RunnerTests.debug.xcconfig"; sourceTree = "<group>"; };
 		E16764B79626AF11D23628CF /* Pods-Runner.profile.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.profile.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"; sourceTree = "<group>"; };
 		EBF53C1C3B9DA1B3827023F8 /* Pods-Runner.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-Runner.debug.xcconfig"; path = "Target Support Files/Pods-Runner/Pods-Runner.debug.xcconfig"; sourceTree = "<group>"; };
@@ -320,9 +320,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Copy Pods Resources";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-Runner/Pods-Runner-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -505,13 +509,14 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.momax.cap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
@@ -527,6 +532,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder.RunnerTests;
@@ -545,6 +551,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder.RunnerTests;
@@ -561,6 +568,7 @@
 				BUNDLE_LOADER = "$(TEST_HOST)";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				GENERATE_INFOPLIST_FILE = YES;
 				MARKETING_VERSION = 1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder.RunnerTests;
@@ -694,13 +702,14 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.momax.cap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
@@ -719,13 +728,14 @@
 				CODE_SIGN_IDENTITY = "Apple Development";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = "$(FLUTTER_BUILD_NUMBER)";
+				DEVELOPMENT_TEAM = 9AZ652M3G3;
 				ENABLE_BITCODE = NO;
 				INFOPLIST_FILE = Runner/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.binwu.reconstruction.spatialDataRecorder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.momax.cap;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "Runner/Runner-Bridging-Header.h";
