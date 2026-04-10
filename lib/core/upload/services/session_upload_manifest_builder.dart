@@ -14,7 +14,7 @@ class SessionUploadManifestBuilder {
     'metadata.json',
   };
 
-  static const String _optionalFramesDir = 'frames2';
+  static const String _requiredFramesDir = 'frames2';
 
   Future<SessionUploadManifest> buildFromSessionPath(String sessionPath) async {
     final sessionDir = Directory(sessionPath);
@@ -56,35 +56,44 @@ class SessionUploadManifestBuilder {
       );
     }
 
-    final framesDir = Directory(p.join(sessionDir.path, _optionalFramesDir));
-    if (await framesDir.exists()) {
-      final frameFiles = await framesDir
-          .list(recursive: true, followLinks: false)
-          .where((entity) => entity is File)
-          .cast<File>()
-          .toList();
+    final framesDir = Directory(p.join(sessionDir.path, _requiredFramesDir));
+    if (!await framesDir.exists()) {
+      throw UploadException(
+        reason: UploadFailureReason.missingRequiredFile,
+        message: '缺少必需目录: $_requiredFramesDir',
+      );
+    }
 
-      frameFiles.sort((a, b) => a.path.compareTo(b.path));
+    final frameFiles = await framesDir
+        .list(recursive: true, followLinks: false)
+        .where((entity) => entity is File)
+        .cast<File>()
+        .toList();
 
-      for (final file in frameFiles) {
-        final stat = await file.stat();
-        if (stat.type != FileSystemEntityType.file) {
-          continue;
-        }
-        final relativeInsideFrames = p.relative(
-          file.path,
-          from: framesDir.path,
-        );
-        final relativePath = p.join(_optionalFramesDir, relativeInsideFrames);
-        totalSizeBytes += stat.size;
-        entries.add(
-          UploadManifestEntry(
-            absolutePath: file.path,
-            relativePath: relativePath,
-            sizeBytes: stat.size,
-          ),
-        );
+    if (frameFiles.isEmpty) {
+      throw UploadException(
+        reason: UploadFailureReason.missingRequiredFile,
+        message: '$_requiredFramesDir 目录为空，至少需要 1 个文件。',
+      );
+    }
+
+    frameFiles.sort((a, b) => a.path.compareTo(b.path));
+
+    for (final file in frameFiles) {
+      final stat = await file.stat();
+      if (stat.type != FileSystemEntityType.file) {
+        continue;
       }
+      final relativeInsideFrames = p.relative(file.path, from: framesDir.path);
+      final relativePath = p.join(_requiredFramesDir, relativeInsideFrames);
+      totalSizeBytes += stat.size;
+      entries.add(
+        UploadManifestEntry(
+          absolutePath: file.path,
+          relativePath: relativePath,
+          sizeBytes: stat.size,
+        ),
+      );
     }
 
     if (entries.isEmpty) {

@@ -83,15 +83,15 @@ private struct PendingJsonlLine {
 
 /// 采集模式：LiDAR 深度 + 广角 RGB（样例风格第二路 gray+depthScale）、或 MultiCam 广角+超广角双 RGB、或单广角。
 private enum DualCaptureMode {
-  /// `data.mov` 广角 RGB + `data2.mov` 深度图转灰度（与样例 `colorFormat: gray`、`depthScale` 一致）
+  /// `data.mov` 广角 RGB + `frames2/*.png` 深度图转灰度（`colorFormat: gray`、`depthScale`）
   case depthAndWide
-  /// `data.mov` 广角 + `data2.mov` 超广角 RGB（无 LiDAR 时回退）
+  /// `data.mov` 广角 + `frames2/*.png` 超广角 RGB（无 LiDAR 时回退）
   case multiCamRgb
   /// 仅广角（配置失败时）
   case singleWide
 }
 
-/// Spectacular 风格：`data.mov` + 可选 `data2.mov`，JSONL 双 `frames`；IMU 与 P1 行为保留。
+/// Spectacular 风格：`data.mov` + 必需 `frames2/*.png`，JSONL 双 `frames`；IMU 与 P1 行为保留。
 final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDelegate,
   AVCaptureVideoDataOutputSampleBufferDelegate
 {
@@ -620,7 +620,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     processVideoSampleBuffer(sampleBuffer, secondSample: sb2, depthCalibration: depthData.cameraCalibrationData)
   }
 
-  /// 将深度图转为 BGRA8，用于写入 `data2.mov`
+  /// 将深度图转为 BGRA8，用于导出 `frames2/*.png`
   private static func depthFloat32ToGrayBGRA(depthData: AVDepthData) -> CVPixelBuffer? {
     let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
     let depthMap = converted.depthDataMap
@@ -795,13 +795,14 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       return
     }
 
-    let hasSecond = captureMode != .singleWide && secondSample != nil && assetWriter2 != nil && videoInput2 != nil
-    let canAppendSecond = hasSecond && (videoInput2?.isReadyForMoreMediaData ?? false)
-    let secondSampleForThisFrame = canAppendSecond ? secondSample : nil
+    let hasSecondWriter =
+      captureMode != .singleWide && secondSample != nil && assetWriter2 != nil && videoInput2 != nil
+    let canAppendSecond = hasSecondWriter && (videoInput2?.isReadyForMoreMediaData ?? false)
+    let secondSampleForThisFrame = secondSample
 
     if !didStartWriter {
       writer.startSession(atSourceTime: primaryPts)
-      if hasSecond, let w2 = assetWriter2 {
+      if hasSecondWriter, let w2 = assetWriter2 {
         w2.startSession(atSourceTime: primaryPts)
       }
 
@@ -980,45 +981,21 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       return false
     }
 
-    guard captureMode != .singleWide, let sec = second, let pb2 = CMSampleBufferGetImageBuffer(sec) else {
-      return true
+    if captureMode != .singleWide, let sec = second, let pb2 = CMSampleBufferGetImageBuffer(sec) {
+      let w2 = CVPixelBufferGetWidth(pb2)
+      let h2 = CVPixelBufferGetHeight(pb2)
+      videoWidth2 = w2
+      videoHeight2 = h2
+    } else {
+      videoWidth2 = 0
+      videoHeight2 = 0
     }
 
-    let w2 = CVPixelBufferGetWidth(pb2)
-    let h2 = CVPixelBufferGetHeight(pb2)
-    videoWidth2 = w2
-    videoHeight2 = h2
-
+    // data2.mov is no longer recorded. Keep only frames2 sequence for the second stream.
     let movie2URL = outputDirectory.appendingPathComponent("data2.mov")
     try? FileManager.default.removeItem(at: movie2URL)
-
-    do {
-      let writer2 = try AVAssetWriter(outputURL: movie2URL, fileType: .mov)
-      let settings2: [String: Any] = [
-        AVVideoCodecKey: AVVideoCodecType.h264,
-        AVVideoWidthKey: w2,
-        AVVideoHeightKey: h2,
-        AVVideoCompressionPropertiesKey: [
-          AVVideoAverageBitRateKey: w2 * h2 * 2,
-          AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
-          AVVideoMaxKeyFrameIntervalKey: 60,
-        ] as [String: Any],
-      ]
-      let input2 = AVAssetWriterInput(mediaType: .video, outputSettings: settings2)
-      input2.expectsMediaDataInRealTime = true
-      guard writer2.canAdd(input2) else {
-        return true
-      }
-      writer2.add(input2)
-      guard writer2.startWriting() else {
-        return true
-      }
-      assetWriter2 = writer2
-      videoInput2 = input2
-    } catch {
-      assetWriter2 = nil
-      videoInput2 = nil
-    }
+    assetWriter2 = nil
+    videoInput2 = nil
 
     return true
   }
@@ -1604,8 +1581,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       "platform": "ios",
       "imu_temperature_status": "unavailable_no_public_api_ios",
       "intrinsics_source": didUpdateIntrinsicsFromSample ? "cmsamplebuffer_attachment" : "heuristic_fallback",
-      "dual_capture_mode": captureMode == .depthAndWide ? "depth_gray_data2"
-        : captureMode == .multiCamRgb ? "wide_ultrawide_rgb_data2" : "single_wide",
+      "dual_capture_mode": captureMode == .depthAndWide ? "depth_gray_frames2"
+        : captureMode == .multiCamRgb ? "wide_ultrawide_rgb_frames2" : "single_wide",
     ]
     root["p1"] = [
       "jsonl_sorted_by_time": true,
@@ -1614,7 +1591,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     root["spectacular_sample_alignment"] = [
       "magnetometer_jsonl": true,
       "per_frame_calibration_rgb": true,
-      "dual_camera_data2": captureMode != .singleWide,
+      "dual_camera_data2": false,
+      "data2_mov_recorded": false,
       "frames2_png_sequence": shouldExportFrames2PngSequence,
       "imu_temperature_jsonl": false,
     ] as [String: Any]
