@@ -14,8 +14,6 @@ class SessionUploadManifestBuilder {
     'metadata.json',
   };
 
-  static const Set<String> _optionalRootFiles = <String>{'data2.mov'};
-
   static const String _optionalFramesDir = 'frames2';
 
   Future<SessionUploadManifest> buildFromSessionPath(String sessionPath) async {
@@ -30,7 +28,6 @@ class SessionUploadManifestBuilder {
     final sessionName = p.basename(sessionDir.path);
     final entries = <UploadManifestEntry>[];
     var totalSizeBytes = 0;
-    var hasData2Mov = false;
 
     for (final fileName in _requiredRootFiles) {
       final file = File(p.join(sessionDir.path, fileName));
@@ -59,30 +56,7 @@ class SessionUploadManifestBuilder {
       );
     }
 
-    for (final fileName in _optionalRootFiles) {
-      final file = File(p.join(sessionDir.path, fileName));
-      if (!await file.exists()) {
-        continue;
-      }
-      final stat = await file.stat();
-      if (stat.type != FileSystemEntityType.file) {
-        continue;
-      }
-      totalSizeBytes += stat.size;
-      if (fileName == 'data2.mov') {
-        hasData2Mov = true;
-      }
-      entries.add(
-        UploadManifestEntry(
-          absolutePath: file.path,
-          relativePath: fileName,
-          sizeBytes: stat.size,
-        ),
-      );
-    }
-
     final framesDir = Directory(p.join(sessionDir.path, _optionalFramesDir));
-    var frames2FileCount = 0;
     if (await framesDir.exists()) {
       final frameFiles = await framesDir
           .list(recursive: true, followLinks: false)
@@ -103,7 +77,6 @@ class SessionUploadManifestBuilder {
         );
         final relativePath = p.join(_optionalFramesDir, relativeInsideFrames);
         totalSizeBytes += stat.size;
-        frames2FileCount += 1;
         entries.add(
           UploadManifestEntry(
             absolutePath: file.path,
@@ -112,13 +85,6 @@ class SessionUploadManifestBuilder {
           ),
         );
       }
-    }
-
-    if (hasData2Mov && frames2FileCount == 0) {
-      throw UploadException(
-        reason: UploadFailureReason.missingRequiredFile,
-        message: '检测到 data2.mov 但缺少 frames2/*.png，请重新录制以生成二路逐帧图像。',
-      );
     }
 
     if (entries.isEmpty) {
