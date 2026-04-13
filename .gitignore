@@ -51,3 +51,4 @@ app.*.map.json
 /docs/*default*
 /docs/*none*
 /docs/*output*
+/docs/*scene*
