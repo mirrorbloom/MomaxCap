@@ -83,19 +83,28 @@ class _RecordingsBrowserPageState extends ConsumerState<RecordingsBrowserPage> {
   ) async {
     try {
       final contextService = ref.read(uploadSessionContextServiceProvider);
-      final uploadContext = await showUploadSessionContextDialog(
-        context: context,
-        sessionPath: directory.path,
-        contextService: contextService,
+      final existingContext = await contextService.readForSession(
+        directory.path,
       );
-      if (uploadContext == null) {
-        if (!mounted) return;
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(const SnackBar(content: Text('会话已保留在本地，未加入上传队列。')));
-        return;
+      if (existingContext == null) {
+        final ensuredContext = await contextService.ensureContextForSession(
+          directory.path,
+        );
+        final uploadContext = await showUploadSessionContextDialog(
+          context: context,
+          sessionPath: directory.path,
+          contextService: contextService,
+        );
+        if (uploadContext == null) {
+          await contextService.writeForSession(directory.path, ensuredContext);
+          if (!mounted) return;
+          ScaffoldMessenger.of(
+            context,
+          ).showSnackBar(const SnackBar(content: Text('已保留本地默认上传信息，未加入上传队列。')));
+          return;
+        }
+        await contextService.writeForSession(directory.path, uploadContext);
       }
-      await contextService.writeForSession(directory.path, uploadContext);
 
       if (existingTask != null &&
           (existingTask.status == UploadTaskStatus.failed ||

@@ -9,6 +9,23 @@ class UploadSessionContextService {
   static final RegExp _allowedSegmentPattern = RegExp(r'^[A-Za-z0-9._-]+$');
   static const String _defaultsFileName = '.upload_context_defaults.json';
 
+  Future<UploadSessionContext> ensureContextForSession(String sessionPath) async {
+    final existing = await readForSession(sessionPath);
+    if (existing != null) {
+      return existing;
+    }
+
+    final created = UploadSessionContext(
+      captureType: UploadCaptureType.sceneOnly,
+      sceneName: generateSceneName(p.basename(sessionPath)),
+      seqName: generateSeqName(p.basename(sessionPath)),
+      audioTrackPresent: await readAudioTrackPresent(sessionPath),
+      confirmedAt: DateTime.now().toUtc(),
+    );
+    await writeForSession(sessionPath, created);
+    return created;
+  }
+
   Future<UploadSessionContext?> readForSession(String sessionPath) async {
     final file = File(p.join(sessionPath, UploadSessionContext.fileName));
     if (!await file.exists()) {
@@ -88,8 +105,7 @@ class UploadSessionContextService {
   }
 
   String generateSeqName(String sessionName) {
-    final suffix = _sessionTimestampSuffix(sessionName);
-    return 'seq_$suffix';
+    return 'seq0';
   }
 
   String generatePairGroupId(String sessionName) {

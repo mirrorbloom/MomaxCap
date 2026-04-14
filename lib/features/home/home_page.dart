@@ -211,6 +211,16 @@ class _HomePageState extends ConsumerState<HomePage> {
       }
 
       final contextService = ref.read(uploadSessionContextServiceProvider);
+      await _refreshStatus();
+      final defaultContext = await contextService.ensureContextForSession(
+        sessionPath,
+      );
+      if (mounted) {
+        setState(() {
+          _busy = false;
+        });
+      }
+      if (!mounted) return;
       final uploadContext = await showUploadSessionContextDialog(
         context: context,
         sessionPath: sessionPath,
@@ -228,9 +238,10 @@ class _HomePageState extends ConsumerState<HomePage> {
         } catch (e) {
           uploadMessage = '录制已完成，但加入上传队列失败：$e';
         }
+      } else {
+        await contextService.writeForSession(sessionPath, defaultContext);
       }
 
-      await _refreshStatus();
       if (mounted) {
         _toast('已停止录制，$uploadMessage');
       }
