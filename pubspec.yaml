@@ -42,6 +42,8 @@ dependencies:
 
   # 权限（相机 / 运动；与 Info.plist 文案配合）
   permission_handler: ^11.4.0
+  mobile_scanner: ^5.2.3
+  qr_flutter: ^4.1.0
 
   # 上传与打包
   dio: ^5.8.0+1

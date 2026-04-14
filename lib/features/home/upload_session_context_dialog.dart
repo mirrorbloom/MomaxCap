@@ -1,6 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:path/path.dart' as p;
+import 'package:qr_flutter/qr_flutter.dart';
 
+import '../../core/upload/models/upload_group_share.dart';
 import '../../core/upload/models/upload_session_context.dart';
 import '../../core/upload/services/upload_session_context_service.dart';
 
@@ -59,12 +63,15 @@ class _UploadSessionContextDialogState
   late final TextEditingController _sceneController;
   late final TextEditingController _seqController;
   late final TextEditingController _groupController;
+  late final TextEditingController _shareCodeController;
 
   late UploadCaptureType _captureType;
   late bool _reuseRecentScene;
   late bool _reuseRecentSeq;
   late bool _groupEnabled;
   late bool _reuseRecentGroup;
+  late _GroupJoinMode _groupJoinMode;
+  UploadGroupShare? _sharedJoinConfig;
 
   UploadSessionContext? get _defaults => widget.defaults;
   bool get _hasRecentScene =>
@@ -89,10 +96,12 @@ class _UploadSessionContextDialogState
     _groupController = TextEditingController(
       text: widget.existing?.pairGroupId ?? '',
     );
+    _shareCodeController = TextEditingController();
     _reuseRecentScene = false;
     _reuseRecentSeq = false;
     _groupEnabled = widget.existing?.isGrouped ?? false;
     _reuseRecentGroup = false;
+    _groupJoinMode = _GroupJoinMode.manualGroupId;
   }
 
   @override
@@ -100,6 +109,7 @@ class _UploadSessionContextDialogState
     _sceneController.dispose();
     _seqController.dispose();
     _groupController.dispose();
+    _shareCodeController.dispose();
     super.dispose();
   }
 
@@ -137,12 +147,14 @@ class _UploadSessionContextDialogState
                       child: Text('带人'),
                     ),
                   ],
-                  onChanged: (value) {
-                    if (value == null) return;
-                    setState(() {
-                      _captureType = value;
-                    });
-                  },
+                  onChanged: _sharedJoinConfig != null
+                      ? null
+                      : (value) {
+                          if (value == null) return;
+                          setState(() {
+                            _captureType = value;
+                          });
+                        },
                 ),
                 const SizedBox(height: 12),
                 if (_hasRecentScene)
@@ -154,12 +166,15 @@ class _UploadSessionContextDialogState
                     onChanged: (value) {
                       setState(() {
                         _reuseRecentScene = value;
+                        if (value) {
+                          _sharedJoinConfig = null;
+                        }
                       });
                     },
                   ),
                 TextFormField(
                   controller: _sceneController,
-                  enabled: !_reuseRecentScene,
+                  enabled: !_reuseRecentScene && _sharedJoinConfig == null,
                   decoration: InputDecoration(
                     labelText: 'Scene 名称',
                     hintText: widget.contextService.generateSceneName(
@@ -168,7 +183,7 @@ class _UploadSessionContextDialogState
                     border: const OutlineInputBorder(),
                   ),
                   validator: (value) {
-                    if (_reuseRecentScene) {
+                    if (_reuseRecentScene || _sharedJoinConfig != null) {
                       return null;
                     }
                     final trimmed = value?.trim() ?? '';
@@ -191,12 +206,15 @@ class _UploadSessionContextDialogState
                     onChanged: (value) {
                       setState(() {
                         _reuseRecentSeq = value;
+                        if (value) {
+                          _sharedJoinConfig = null;
+                        }
                       });
                     },
                   ),
                 TextFormField(
                   controller: _seqController,
-                  enabled: !_reuseRecentSeq,
+                  enabled: !_reuseRecentSeq && _sharedJoinConfig == null,
                   decoration: InputDecoration(
                     labelText: 'Seq 名称',
                     hintText: widget.contextService.generateSeqName(
@@ -205,7 +223,7 @@ class _UploadSessionContextDialogState
                     border: const OutlineInputBorder(),
                   ),
                   validator: (value) {
-                    if (_reuseRecentSeq) {
+                    if (_reuseRecentSeq || _sharedJoinConfig != null) {
                       return null;
                     }
                     final trimmed = value?.trim() ?? '';
@@ -229,10 +247,39 @@ class _UploadSessionContextDialogState
                       _groupEnabled = value;
                       if (!value) {
                         _reuseRecentGroup = false;
+                        _sharedJoinConfig = null;
                       }
                     });
                   },
                 ),
+                if (_groupEnabled)
+                  DropdownButtonFormField<_GroupJoinMode>(
+                    value: _groupJoinMode,
+                    decoration: const InputDecoration(
+                      labelText: '加入方式',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: const [
+                      DropdownMenuItem(
+                        value: _GroupJoinMode.manualGroupId,
+                        child: Text('手动输入组号'),
+                      ),
+                      DropdownMenuItem(
+                        value: _GroupJoinMode.shareCode,
+                        child: Text('输入共享码或扫码'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      if (value == null) return;
+                      setState(() {
+                        _groupJoinMode = value;
+                        _reuseRecentGroup = false;
+                        _sharedJoinConfig = null;
+                        _shareCodeController.clear();
+                      });
+                    },
+                  ),
+                if (_groupEnabled) const SizedBox(height: 12),
                 if (_groupEnabled && _hasRecentGroup)
                   SwitchListTile(
                     value: _reuseRecentGroup,
@@ -242,13 +289,19 @@ class _UploadSessionContextDialogState
                     onChanged: (value) {
                       setState(() {
                         _reuseRecentGroup = value;
+                        if (value) {
+                          _sharedJoinConfig = null;
+                          _shareCodeController.clear();
+                        }
                       });
                     },
                   ),
-                if (_groupEnabled)
+                if (_groupEnabled &&
+                    !_reuseRecentGroup &&
+                    _groupJoinMode == _GroupJoinMode.manualGroupId)
                   TextFormField(
                     controller: _groupController,
-                    enabled: !_reuseRecentGroup,
+                    enabled: true,
                     decoration: InputDecoration(
                       labelText: 'Group ID',
                       hintText: widget.contextService.generatePairGroupId(
@@ -257,7 +310,9 @@ class _UploadSessionContextDialogState
                       border: const OutlineInputBorder(),
                     ),
                     validator: (value) {
-                      if (!_groupEnabled || _reuseRecentGroup) {
+                      if (!_groupEnabled ||
+                          _reuseRecentGroup ||
+                          _groupJoinMode != _GroupJoinMode.manualGroupId) {
                         return null;
                       }
                       final trimmed = value?.trim() ?? '';
@@ -270,6 +325,100 @@ class _UploadSessionContextDialogState
                       return null;
                     },
                   ),
+                if (_groupEnabled &&
+                    !_reuseRecentGroup &&
+                    _groupJoinMode == _GroupJoinMode.shareCode)
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextFormField(
+                        controller: _shareCodeController,
+                        decoration: const InputDecoration(
+                          labelText: '共享码',
+                          hintText: '输入共享码，或点击扫码导入',
+                          border: OutlineInputBorder(),
+                        ),
+                        validator: (value) {
+                          if (!_groupEnabled ||
+                              _reuseRecentGroup ||
+                              _groupJoinMode != _GroupJoinMode.shareCode) {
+                            return null;
+                          }
+                          final trimmed = value?.trim() ?? '';
+                          if (_sharedJoinConfig != null) {
+                            return null;
+                          }
+                          if (trimmed.isEmpty) {
+                            return '请输入共享码或使用扫码';
+                          }
+                          if (UploadGroupShare.tryParse(trimmed) == null) {
+                            return '共享码格式无效';
+                          }
+                          return null;
+                        },
+                      ),
+                      const SizedBox(height: 8),
+                      Row(
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: _applyShareCodeFromInput,
+                            icon: const Icon(Icons.login),
+                            label: const Text('导入共享码'),
+                          ),
+                          const SizedBox(width: 8),
+                          OutlinedButton.icon(
+                            onPressed: _scanShareCode,
+                            icon: const Icon(Icons.qr_code_scanner),
+                            label: const Text('扫码导入'),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                if (_sharedJoinConfig != null) ...[
+                  const SizedBox(height: 8),
+                  DecoratedBox(
+                    decoration: BoxDecoration(
+                      color: Colors.blueGrey.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: Colors.blueGrey.shade200),
+                    ),
+                    child: Padding(
+                      padding: const EdgeInsets.all(12),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          const Text('已导入共享配置'),
+                          const SizedBox(height: 6),
+                          Text('Scene: ${_sharedJoinConfig!.sceneName}'),
+                          Text('Seq: ${_sharedJoinConfig!.seqName}'),
+                          Text('Group: ${_sharedJoinConfig!.pairGroupId}'),
+                          const SizedBox(height: 8),
+                          TextButton(
+                            onPressed: () {
+                              setState(() {
+                                _sharedJoinConfig = null;
+                                _shareCodeController.clear();
+                              });
+                            },
+                            child: const Text('清除共享配置'),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+                if (_groupEnabled) ...[
+                  const SizedBox(height: 8),
+                  Align(
+                    alignment: Alignment.centerLeft,
+                    child: OutlinedButton.icon(
+                      onPressed: _showShareQrCode,
+                      icon: const Icon(Icons.qr_code_2),
+                      label: const Text('显示共享二维码'),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 12),
                 ListTile(
                   contentPadding: EdgeInsets.zero,
@@ -297,29 +446,45 @@ class _UploadSessionContextDialogState
     if (!_formKey.currentState!.validate()) {
       return;
     }
-    final sceneName = _reuseRecentScene && _hasRecentScene
-        ? _defaults!.sceneName
-        : _resolveOrGenerate(
-            _sceneController.text,
-            widget.contextService.generateSceneName(widget.sessionName),
-          );
-    final seqName = _reuseRecentSeq && _hasRecentSeq
-        ? _defaults!.seqName
-        : _resolveOrGenerate(
-            _seqController.text,
-            widget.contextService.generateSeqName(widget.sessionName),
-          );
+    UploadGroupShare? shareConfig = _sharedJoinConfig;
+    if (_groupEnabled &&
+        !_reuseRecentGroup &&
+        _groupJoinMode == _GroupJoinMode.shareCode &&
+        shareConfig == null) {
+      shareConfig = UploadGroupShare.tryParse(_shareCodeController.text);
+    }
+
+    final sceneName =
+        shareConfig?.sceneName ??
+        (_reuseRecentScene && _hasRecentScene
+            ? _defaults!.sceneName
+            : _resolveOrGenerate(
+                _sceneController.text,
+                widget.contextService.generateSceneName(widget.sessionName),
+              ));
+    final seqName =
+        shareConfig?.seqName ??
+        (_reuseRecentSeq && _hasRecentSeq
+            ? _defaults!.seqName
+            : _resolveOrGenerate(
+                _seqController.text,
+                widget.contextService.generateSeqName(widget.sessionName),
+              ));
     final pairGroupId = !_groupEnabled
         ? null
-        : (_reuseRecentGroup && _hasRecentGroup
-              ? _defaults!.pairGroupId
-              : _resolveOrGenerate(
-                  _groupController.text,
-                  widget.contextService.generatePairGroupId(widget.sessionName),
-                ));
+        : (shareConfig?.pairGroupId ??
+              (_reuseRecentGroup && _hasRecentGroup
+                  ? _defaults!.pairGroupId
+                  : _resolveOrGenerate(
+                      _groupController.text,
+                      widget.contextService.generatePairGroupId(
+                        widget.sessionName,
+                      ),
+                    )));
 
     final sessionContext = UploadSessionContext(
-      captureType: _captureType,
+      captureName: shareConfig?.captureName,
+      captureType: shareConfig?.captureType ?? _captureType,
       sceneName: sceneName,
       seqName: seqName,
       pairGroupId: pairGroupId,
@@ -335,5 +500,209 @@ class _UploadSessionContextDialogState
       return normalized;
     }
     return generatedFallback;
+  }
+
+  void _applyShareCodeFromInput() {
+    final share = UploadGroupShare.tryParse(_shareCodeController.text);
+    if (share == null) {
+      _showMessage('共享码格式无效。');
+      return;
+    }
+    _applySharedJoinConfig(share, rawCode: _shareCodeController.text.trim());
+  }
+
+  Future<void> _scanShareCode() async {
+    final rawCode = await showDialog<String>(
+      context: context,
+      builder: (_) => const _GroupShareScannerDialog(),
+    );
+    if (!mounted || rawCode == null || rawCode.trim().isEmpty) {
+      return;
+    }
+    final share = UploadGroupShare.tryParse(rawCode);
+    if (share == null) {
+      _showMessage('扫码内容不是有效的共享码。');
+      return;
+    }
+    _applySharedJoinConfig(share, rawCode: rawCode);
+  }
+
+  void _applySharedJoinConfig(
+    UploadGroupShare share, {
+    required String rawCode,
+  }) {
+    setState(() {
+      _sharedJoinConfig = share;
+      _captureType = share.captureType;
+      _sceneController.text = share.sceneName;
+      _seqController.text = share.seqName;
+      _groupController.text = share.pairGroupId;
+      _shareCodeController.text = rawCode.trim();
+      _reuseRecentGroup = false;
+      _reuseRecentScene = false;
+      _reuseRecentSeq = false;
+      _groupEnabled = true;
+      _groupJoinMode = _GroupJoinMode.shareCode;
+    });
+  }
+
+  Future<void> _showShareQrCode() async {
+    final share = _buildCurrentShare();
+    if (share == null) {
+      _showMessage('当前分组信息无效，无法生成共享二维码。');
+      return;
+    }
+    await showDialog<void>(
+      context: context,
+      builder: (_) => _GroupShareQrDialog(share: share),
+    );
+  }
+
+  UploadGroupShare? _buildCurrentShare() {
+    if (!_groupEnabled) {
+      return null;
+    }
+    final sceneName =
+        _sharedJoinConfig?.sceneName ??
+        (_reuseRecentScene && _hasRecentScene
+            ? _defaults!.sceneName
+            : _resolveOrGenerate(
+                _sceneController.text,
+                widget.contextService.generateSceneName(widget.sessionName),
+              ));
+    final seqName =
+        _sharedJoinConfig?.seqName ??
+        (_reuseRecentSeq && _hasRecentSeq
+            ? _defaults!.seqName
+            : _resolveOrGenerate(
+                _seqController.text,
+                widget.contextService.generateSeqName(widget.sessionName),
+              ));
+    final pairGroupId =
+        _sharedJoinConfig?.pairGroupId ??
+        (_reuseRecentGroup && _hasRecentGroup
+            ? _defaults!.pairGroupId
+            : _resolveOrGenerate(
+                _groupController.text,
+                widget.contextService.generatePairGroupId(widget.sessionName),
+              ));
+
+    if (!widget.contextService.isValidSegment(sceneName) ||
+        !widget.contextService.isValidSegment(seqName) ||
+        pairGroupId == null ||
+        !widget.contextService.isValidSegment(pairGroupId)) {
+      return null;
+    }
+    return UploadGroupShare(
+      captureType: _sharedJoinConfig?.captureType ?? _captureType,
+      sceneName: sceneName,
+      seqName: seqName,
+      pairGroupId: pairGroupId,
+    );
+  }
+
+  void _showMessage(String message) {
+    final messenger = ScaffoldMessenger.maybeOf(context);
+    messenger?.hideCurrentSnackBar();
+    messenger?.showSnackBar(SnackBar(content: Text(message)));
+  }
+}
+
+enum _GroupJoinMode { manualGroupId, shareCode }
+
+class _GroupShareQrDialog extends StatelessWidget {
+  const _GroupShareQrDialog({required this.share});
+
+  final UploadGroupShare share;
+
+  @override
+  Widget build(BuildContext context) {
+    final shareCode = share.toShareCode();
+    return AlertDialog(
+      title: const Text('共享二维码'),
+      content: SizedBox(
+        width: 320,
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Center(child: QrImageView(data: shareCode, size: 220)),
+            const SizedBox(height: 12),
+            Text('Scene: ${share.sceneName}'),
+            Text('Seq: ${share.seqName}'),
+            Text('Group: ${share.pairGroupId}'),
+            const SizedBox(height: 12),
+            SelectableText(
+              shareCode,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () async {
+            await Clipboard.setData(ClipboardData(text: shareCode));
+            if (!context.mounted) return;
+            ScaffoldMessenger.maybeOf(
+              context,
+            )?.showSnackBar(const SnackBar(content: Text('共享码已复制。')));
+          },
+          child: const Text('复制共享码'),
+        ),
+        FilledButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('关闭'),
+        ),
+      ],
+    );
+  }
+}
+
+class _GroupShareScannerDialog extends StatefulWidget {
+  const _GroupShareScannerDialog();
+
+  @override
+  State<_GroupShareScannerDialog> createState() =>
+      _GroupShareScannerDialogState();
+}
+
+class _GroupShareScannerDialogState extends State<_GroupShareScannerDialog> {
+  bool _handled = false;
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('扫码加入同步组'),
+      content: SizedBox(
+        width: 320,
+        height: 320,
+        child: ClipRRect(
+          borderRadius: BorderRadius.circular(12),
+          child: MobileScanner(
+            onDetect: (capture) {
+              if (_handled) {
+                return;
+              }
+              final value = capture.barcodes
+                  .map((code) => code.rawValue)
+                  .whereType<String>()
+                  .firstWhere((raw) => raw.trim().isNotEmpty, orElse: () => '');
+              if (value.isEmpty) {
+                return;
+              }
+              _handled = true;
+              Navigator.of(context).pop(value);
+            },
+          ),
+        ),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text('取消'),
+        ),
+      ],
+    );
   }
 }
