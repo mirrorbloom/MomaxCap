@@ -6,7 +6,10 @@ import 'package:path/path.dart' as p;
 import '../models/upload_session_context.dart';
 
 class UploadSessionContextService {
-  static final RegExp _allowedSegmentPattern = RegExp(r'^[A-Za-z0-9._-]+$');
+  static final RegExp _allowedSegmentPattern = RegExp(
+    r'^[A-Za-z0-9][A-Za-z0-9._-]*$',
+  );
+  static final RegExp _allowedSeqNamePattern = RegExp(r'^seq\d+$');
   static const String _defaultsFileName = '.upload_context_defaults.json';
 
   Future<UploadSessionContext> ensureContextForSession(String sessionPath) async {
@@ -121,6 +124,11 @@ class UploadSessionContextService {
         _allowedSegmentPattern.hasMatch(trimmed);
   }
 
+  bool isValidSeqName(String value) {
+    final trimmed = value.trim();
+    return isValidSegment(trimmed) && _allowedSeqNamePattern.hasMatch(trimmed);
+  }
+
   String normalizeSegment(String value) {
     final trimmed = value.trim();
     final normalized = trimmed.replaceAll(RegExp(r'[^A-Za-z0-9._-]+'), '_');
@@ -131,6 +139,22 @@ class UploadSessionContextService {
     if (!isValidSegment(context.sceneName) || !isValidSegment(context.seqName)) {
       return false;
     }
+    if (context.captureType == UploadCaptureType.humanInScene) {
+      if (!isValidSeqName(context.seqName)) {
+        return false;
+      }
+      if (context.cam == null) {
+        return false;
+      }
+    }
+
+    if (context.captureType == UploadCaptureType.sceneOnly) {
+      // scene-only ignores cam; keep it unset to avoid confusion.
+      if (context.cam != null) {
+        return false;
+      }
+    }
+
     if (context.captureName != null &&
         context.captureName!.isNotEmpty &&
         !isValidSegment(context.captureName!)) {

@@ -22,6 +22,35 @@ enum UploadCaptureType {
   }
 }
 
+enum UploadCam {
+  A,
+  B;
+
+  String get wireValue {
+    switch (this) {
+      case UploadCam.A:
+        return 'A';
+      case UploadCam.B:
+        return 'B';
+    }
+  }
+
+  static UploadCam? fromWireValue(String? value) {
+    final normalized = (value ?? '').trim().toUpperCase();
+    switch (normalized) {
+      case 'A':
+      case 'L':
+      case '1':
+        return UploadCam.A;
+      case 'B':
+      case 'R':
+      case '2':
+        return UploadCam.B;
+    }
+    return null;
+  }
+}
+
 class UploadSessionContext {
   const UploadSessionContext({
     required this.captureType,
@@ -30,6 +59,7 @@ class UploadSessionContext {
     required this.audioTrackPresent,
     required this.confirmedAt,
     this.captureName,
+    this.cam,
     this.pairGroupId,
   });
 
@@ -39,6 +69,7 @@ class UploadSessionContext {
   final UploadCaptureType captureType;
   final String sceneName;
   final String seqName;
+  final UploadCam? cam;
   final String? pairGroupId;
   final bool audioTrackPresent;
   final DateTime confirmedAt;
@@ -51,6 +82,8 @@ class UploadSessionContext {
     UploadCaptureType? captureType,
     String? sceneName,
     String? seqName,
+    UploadCam? cam,
+    bool clearCam = false,
     String? pairGroupId,
     bool clearPairGroupId = false,
     bool? audioTrackPresent,
@@ -61,6 +94,7 @@ class UploadSessionContext {
       captureType: captureType ?? this.captureType,
       sceneName: sceneName ?? this.sceneName,
       seqName: seqName ?? this.seqName,
+      cam: clearCam ? null : (cam ?? this.cam),
       pairGroupId: clearPairGroupId ? null : (pairGroupId ?? this.pairGroupId),
       audioTrackPresent: audioTrackPresent ?? this.audioTrackPresent,
       confirmedAt: confirmedAt ?? this.confirmedAt,
@@ -75,6 +109,7 @@ class UploadSessionContext {
       'captureType': captureType.wireValue,
       'sceneName': sceneName,
       'seqName': seqName,
+      if (cam != null) 'cam': cam!.wireValue,
       if (pairGroupId != null && pairGroupId!.isNotEmpty)
         'pairGroupId': pairGroupId,
       'audioTrackPresent': audioTrackPresent,
@@ -90,6 +125,7 @@ class UploadSessionContext {
       ),
       sceneName: (json['sceneName'] as String? ?? '').trim(),
       seqName: (json['seqName'] as String? ?? '').trim(),
+      cam: UploadCam.fromWireValue(json['cam'] as String?),
       pairGroupId: (json['pairGroupId'] as String?)?.trim(),
       audioTrackPresent: json['audioTrackPresent'] == true,
       confirmedAt:

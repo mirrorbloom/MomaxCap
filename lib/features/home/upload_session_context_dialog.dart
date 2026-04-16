@@ -90,12 +90,14 @@ class _UploadSessionContextDialog extends StatefulWidget {
 class _UploadSessionContextDialogState
     extends State<_UploadSessionContextDialog> {
   final _formKey = GlobalKey<FormState>();
+  late final TextEditingController _captureNameController;
   late final TextEditingController _sceneController;
   late final TextEditingController _seqController;
   late final TextEditingController _groupController;
   late final TextEditingController _shareCodeController;
 
   late UploadCaptureType _captureType;
+  late UploadCam? _cam;
   late bool _reuseRecentScene;
   late bool _reuseRecentSeq;
   late bool _groupEnabled;
@@ -120,6 +122,10 @@ class _UploadSessionContextDialogState
     super.initState();
     final seed = widget.existing ?? widget.defaults;
     _captureType = seed?.captureType ?? UploadCaptureType.sceneOnly;
+    _cam = seed?.cam ?? (_captureType == UploadCaptureType.humanInScene ? UploadCam.A : null);
+    _captureNameController = TextEditingController(
+      text: widget.existing?.captureName ?? widget.defaults?.captureName ?? '',
+    );
     _sceneController = TextEditingController(
       text: widget.existing?.sceneName ?? '',
     );
@@ -139,6 +145,7 @@ class _UploadSessionContextDialogState
 
   @override
   void dispose() {
+    _captureNameController.dispose();
     _sceneController.dispose();
     _seqController.dispose();
     _groupController.dispose();
@@ -164,6 +171,32 @@ class _UploadSessionContextDialogState
                   style: Theme.of(context).textTheme.bodySmall,
                 ),
                 const SizedBox(height: 12),
+                TextFormField(
+                  controller: _captureNameController,
+                  enabled: _sharedJoinConfig == null ||
+                      _sharedJoinConfig!.captureName == null ||
+                      _sharedJoinConfig!.captureName!.trim().isEmpty,
+                  decoration: const InputDecoration(
+                    labelText: '上传名（captureName）',
+                    border: OutlineInputBorder(),
+                  ),
+                  validator: (value) {
+                    final shareCaptureName = _sharedJoinConfig?.captureName;
+                    if (shareCaptureName != null &&
+                        shareCaptureName.trim().isNotEmpty) {
+                      return null;
+                    }
+                    final trimmed = value?.trim() ?? '';
+                    if (trimmed.isEmpty) {
+                      return null;
+                    }
+                    if (!widget.contextService.isValidSegment(trimmed)) {
+                      return '仅支持字母、数字、点、下划线、短横线，且必须以字母或数字开头';
+                    }
+                    return null;
+                  },
+                ),
+                const SizedBox(height: 12),
                 DropdownButtonFormField<UploadCaptureType>(
                   value: _captureType,
                   decoration: const InputDecoration(
@@ -186,10 +219,49 @@ class _UploadSessionContextDialogState
                           if (value == null) return;
                           setState(() {
                             _captureType = value;
+                            if (_captureType == UploadCaptureType.sceneOnly) {
+                              _cam = null;
+                            } else {
+                              _cam ??= UploadCam.A;
+                            }
                           });
                         },
                 ),
                 const SizedBox(height: 12),
+                if (_captureType == UploadCaptureType.humanInScene) ...[
+                  DropdownButtonFormField<UploadCam>(
+                    value: _cam,
+                    decoration: const InputDecoration(
+                      labelText: '视角（Cam）',
+                      border: OutlineInputBorder(),
+                    ),
+                    items: const [
+                      DropdownMenuItem(
+                        value: UploadCam.A,
+                        child: Text('A（raw1）'),
+                      ),
+                      DropdownMenuItem(
+                        value: UploadCam.B,
+                        child: Text('B（raw2）'),
+                      ),
+                    ],
+                    onChanged: (value) {
+                      setState(() {
+                        _cam = value;
+                      });
+                    },
+                    validator: (value) {
+                      if (_captureType != UploadCaptureType.humanInScene) {
+                        return null;
+                      }
+                      if (value == null) {
+                        return '带人拍摄需要指定 A/B 视角';
+                      }
+                      return null;
+                    },
+                  ),
+                  const SizedBox(height: 12),
+                ],
                 if (_hasRecentScene)
                   SwitchListTile(
                     value: _reuseRecentScene,
@@ -224,7 +296,7 @@ class _UploadSessionContextDialogState
                       return null;
                     }
                     if (!widget.contextService.isValidSegment(trimmed)) {
-                      return '仅支持字母、数字、点、下划线、短横线';
+                      return '仅支持字母、数字、点、下划线、短横线，且必须以字母或数字开头';
                     }
                     return null;
                   },
@@ -263,8 +335,14 @@ class _UploadSessionContextDialogState
                     if (trimmed.isEmpty) {
                       return null;
                     }
+                    if (_captureType == UploadCaptureType.humanInScene) {
+                      if (!widget.contextService.isValidSeqName(trimmed)) {
+                        return '带人拍摄必须使用 seq0/seq1/seq2...';
+                      }
+                      return null;
+                    }
                     if (!widget.contextService.isValidSegment(trimmed)) {
-                      return '仅支持字母、数字、点、下划线、短横线';
+                      return '仅支持字母、数字、点、下划线、短横线，且必须以字母或数字开头';
                     }
                     return null;
                   },
@@ -423,6 +501,9 @@ class _UploadSessionContextDialogState
                         children: [
                           const Text('已导入共享配置'),
                           const SizedBox(height: 6),
+                          if (_sharedJoinConfig!.captureName != null &&
+                              _sharedJoinConfig!.captureName!.isNotEmpty)
+                            Text('Capture: ${_sharedJoinConfig!.captureName}'),
                           Text('Scene: ${_sharedJoinConfig!.sceneName}'),
                           Text('Seq: ${_sharedJoinConfig!.seqName}'),
                           Text('Group: ${_sharedJoinConfig!.pairGroupId}'),
@@ -522,11 +603,17 @@ class _UploadSessionContextDialogState
                       ),
                     )));
 
+    final captureName =
+        shareConfig?.captureName?.trim().isNotEmpty == true
+            ? shareConfig!.captureName!.trim()
+            : _resolveOptionalSegment(_captureNameController.text);
+
     final sessionContext = UploadSessionContext(
-      captureName: shareConfig?.captureName,
+      captureName: captureName,
       captureType: shareConfig?.captureType ?? _captureType,
       sceneName: sceneName,
       seqName: seqName,
+      cam: (shareConfig?.captureType ?? _captureType) == UploadCaptureType.humanInScene ? _cam : null,
       pairGroupId: pairGroupId,
       audioTrackPresent: widget.audioTrackPresent,
       confirmedAt: DateTime.now().toUtc(),
@@ -542,10 +629,22 @@ class _UploadSessionContextDialogState
     return generatedFallback;
   }
 
+  String? _resolveOptionalSegment(String rawValue) {
+    final normalized = widget.contextService.normalizeSegment(rawValue);
+    if (normalized.isEmpty) {
+      return null;
+    }
+    return normalized;
+  }
+
   void _applyShareCodeFromInput() {
     final share = UploadGroupShare.tryParse(_shareCodeController.text);
     if (share == null) {
       _showMessage('共享码格式无效。');
+      return;
+    }
+    if (!_isValidShare(share)) {
+      _showMessage('共享码内容不符合命名规则。');
       return;
     }
     _applySharedJoinConfig(share, rawCode: _shareCodeController.text.trim());
@@ -564,6 +663,10 @@ class _UploadSessionContextDialogState
       _showMessage('扫码内容不是有效的共享码。');
       return;
     }
+    if (!_isValidShare(share)) {
+      _showMessage('共享码内容不符合命名规则。');
+      return;
+    }
     _applySharedJoinConfig(share, rawCode: rawCode);
   }
 
@@ -574,6 +677,10 @@ class _UploadSessionContextDialogState
     setState(() {
       _sharedJoinConfig = share;
       _captureType = share.captureType;
+      _cam = share.captureType == UploadCaptureType.humanInScene ? UploadCam.B : null;
+      if (share.captureName != null && share.captureName!.trim().isNotEmpty) {
+        _captureNameController.text = share.captureName!.trim();
+      }
       _sceneController.text = share.sceneName;
       _seqController.text = share.seqName;
       _groupController.text = share.pairGroupId;
@@ -602,6 +709,11 @@ class _UploadSessionContextDialogState
     if (!_groupEnabled) {
       return null;
     }
+    final captureType = _sharedJoinConfig?.captureType ?? _captureType;
+    final captureName =
+        _sharedJoinConfig?.captureName?.trim().isNotEmpty == true
+            ? _sharedJoinConfig!.captureName!.trim()
+            : _resolveOptionalSegment(_captureNameController.text);
     final sceneName =
         _sharedJoinConfig?.sceneName ??
         (_reuseRecentScene && _hasRecentScene
@@ -627,18 +739,54 @@ class _UploadSessionContextDialogState
                 widget.contextService.generatePairGroupId(widget.sessionName),
               ));
 
+    final validSeq = captureType == UploadCaptureType.humanInScene
+        ? widget.contextService.isValidSeqName(seqName)
+        : widget.contextService.isValidSegment(seqName);
+
     if (!widget.contextService.isValidSegment(sceneName) ||
-        !widget.contextService.isValidSegment(seqName) ||
+        !validSeq ||
         pairGroupId == null ||
         !widget.contextService.isValidSegment(pairGroupId)) {
       return null;
     }
+    if (captureName != null &&
+        captureName.isNotEmpty &&
+        !widget.contextService.isValidSegment(captureName)) {
+      return null;
+    }
     return UploadGroupShare(
-      captureType: _sharedJoinConfig?.captureType ?? _captureType,
+      captureName: captureName,
+      captureType: captureType,
       sceneName: sceneName,
       seqName: seqName,
       pairGroupId: pairGroupId,
     );
+  }
+
+  bool _isValidShare(UploadGroupShare share) {
+    if (share.sceneName.isEmpty ||
+        share.seqName.isEmpty ||
+        share.pairGroupId.isEmpty) {
+      return false;
+    }
+    if (!widget.contextService.isValidSegment(share.sceneName)) {
+      return false;
+    }
+    final validSeq = share.captureType == UploadCaptureType.humanInScene
+        ? widget.contextService.isValidSeqName(share.seqName)
+        : widget.contextService.isValidSegment(share.seqName);
+    if (!validSeq) {
+      return false;
+    }
+    if (!widget.contextService.isValidSegment(share.pairGroupId)) {
+      return false;
+    }
+    if (share.captureName != null &&
+        share.captureName!.isNotEmpty &&
+        !widget.contextService.isValidSegment(share.captureName!)) {
+      return false;
+    }
+    return true;
   }
 
   void _showMessage(String message) {
@@ -670,6 +818,8 @@ class _GroupShareQrDialog extends StatelessWidget {
           children: [
             Center(child: QrImageView(data: shareCode, size: 220)),
             const SizedBox(height: 12),
+            if (share.captureName != null && share.captureName!.isNotEmpty)
+              Text('Capture: ${share.captureName}'),
             Text('Scene: ${share.sceneName}'),
             Text('Seq: ${share.seqName}'),
             Text('Group: ${share.pairGroupId}'),

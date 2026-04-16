@@ -4,6 +4,7 @@ import 'package:archive/archive.dart';
 import 'package:path/path.dart' as p;
 
 import '../models/upload_manifest.dart';
+import '../models/upload_session_context.dart';
 import '../models/upload_task.dart';
 import '../upload_exceptions.dart';
 
@@ -20,8 +21,12 @@ class UploadZipResult {
 }
 
 class UploadZipService {
+  static final RegExp _sceneAllowed = RegExp(r'^[A-Za-z0-9][A-Za-z0-9._-]*$');
+  static final RegExp _seqAllowed = RegExp(r'^seq\d+$');
+
   Future<UploadZipResult> compressManifest(
     SessionUploadManifest manifest, {
+    UploadSessionContext? sessionContext,
     void Function(int current, int total)? onProgress,
   }) async {
     final sessionDir = Directory(manifest.sessionPath);
@@ -31,8 +36,7 @@ class UploadZipService {
       await cacheDir.create(recursive: true);
     }
 
-    final zipFileName =
-        '${manifest.sessionName}_${DateTime.now().millisecondsSinceEpoch}.zip';
+    final zipFileName = _buildZipFileName(manifest, sessionContext);
     final zipPath = p.join(cacheDir.path, zipFileName);
 
     try {
@@ -89,5 +93,56 @@ class UploadZipService {
     if (await file.exists()) {
       await file.delete();
     }
+  }
+
+  String _buildZipFileName(
+    SessionUploadManifest manifest,
+    UploadSessionContext? sessionContext,
+  ) {
+    if (sessionContext == null) {
+      return '${manifest.sessionName}_${DateTime.now().millisecondsSinceEpoch}.zip';
+    }
+
+    final base = manifest.sessionName.startsWith('recording_')
+        ? manifest.sessionName
+        : 'recording_${manifest.sessionName}';
+
+    final sceneName = sessionContext.sceneName.trim();
+    if (!_sceneAllowed.hasMatch(sceneName)) {
+      throw UploadException(
+        reason: UploadFailureReason.unknown,
+        message: 'Scene 名称不合法，无法生成 ZIP 文件名：$sceneName',
+        retryable: false,
+      );
+    }
+
+    final typeToken = sessionContext.captureType == UploadCaptureType.humanInScene
+        ? 'human'
+        : 'scene';
+
+    final parts = <String>['${base}__scene=$sceneName', 'type=$typeToken'];
+
+    if (typeToken == 'human') {
+      final seqName = sessionContext.seqName.trim();
+      if (!_seqAllowed.hasMatch(seqName)) {
+        throw UploadException(
+          reason: UploadFailureReason.unknown,
+          message: 'Seq 名称不合法（需为 seq0/seq1/...），无法生成 ZIP 文件名：$seqName',
+          retryable: false,
+        );
+      }
+      final cam = sessionContext.cam;
+      if (cam == null) {
+        throw UploadException(
+          reason: UploadFailureReason.unknown,
+          message: '带人拍摄缺少 cam=A/B，无法生成 ZIP 文件名。',
+          retryable: false,
+        );
+      }
+      parts.add('seq=$seqName');
+      parts.add('cam=${cam.wireValue}');
+    }
+
+    return '${parts.join('__')}.zip';
   }
 }

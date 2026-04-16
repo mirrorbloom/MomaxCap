@@ -320,7 +320,13 @@ class UploadQueueController extends StateNotifier<UploadQueueState> {
       final manifest = await _manifestBuilder.buildFromSessionPath(
         task.sessionPath,
       );
-      final zipResult = await _zipService.compressManifest(manifest);
+      final sessionContext = await _contextService.ensureContextForSession(
+        task.sessionPath,
+      );
+      final zipResult = await _zipService.compressManifest(
+        manifest,
+        sessionContext: sessionContext,
+      );
 
       task = await _updateTaskAndPersist(
         taskId,
@@ -346,7 +352,6 @@ class UploadQueueController extends StateNotifier<UploadQueueState> {
       }
 
       final zipFile = File(zipResult.zipPath);
-      final sessionContext = await _contextService.readForSession(task.sessionPath);
       _activeCancelToken = CancelToken();
       final response = await _httpClient.uploadZip(
         task: task,
