@@ -149,24 +149,16 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   private var lastSecondPrincipalPointX: Double = 0
   private var lastSecondPrincipalPointY: Double = 0
   private var didUpdateSecondIntrinsics = false
-  private var lastDepthToWideExtrinsic: [[Double]]?
-
-  private var lastPrimaryImuToCameraSource = "capture_convention_back_camera_axes"
-  private var lastSecondaryImuToCameraSource = "not_applicable_single_camera"
-
   /// MultiCam：待配对的超广角缓冲
   private var ultraBufferQueue: [CMSampleBuffer] = []
   private var pendingWideBuffers: [CMSampleBuffer] = []
 
   private var isStopping = false
   private var didStartWriter = false
-  private var didAppendAudioSample = false
   private var lastPrimaryWrittenPts: CMTime?
   private var lastSecondaryWrittenPts: CMTime?
   private var audioPermissionGranted = false
   private var audioCaptureEnabled = false
-  private var audioSampleRate: Double = 0
-  private var audioChannelCount: Int = 0
 
   /// 样例与 Spectacular 常用：米/灰度量化（仅作语义对齐；实际深度以 Float 录制为准）
   private let jsonDepthScale: Double = 0.001
@@ -175,6 +167,9 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   private static let targetVideoWidth = 1920
   private static let targetVideoHeight = 1440
   private static let targetCaptureFps: Double = 30
+  private static let targetDepthWidth = 256
+  private static let targetDepthHeight = 192
+  private static let spectacularSecondaryImuTranslationX: Double = 0.1
 
   private var frames2DirectoryURL: URL {
     outputDirectory.appendingPathComponent("frames2", isDirectory: true)
@@ -245,9 +240,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     assetWriter2 = nil
     videoInput2 = nil
     pendingJsonl.removeAll(keepingCapacity: true)
-    didAppendAudioSample = false
-    audioSampleRate = 0
-    audioChannelCount = 0
     audioCaptureEnabled = requestedAudioCapture && audioPermissionGranted
 
     if configureDepthAndWideSession() {
@@ -264,9 +256,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       return
     }
 
-    lastDepthToWideExtrinsic = nil
-    lastPrimaryImuToCameraSource = "capture_convention_back_camera_axes"
-    lastSecondaryImuToCameraSource = "not_applicable_single_camera"
     lastPrimaryWrittenPts = nil
     lastSecondaryWrittenPts = nil
     isSecondaryRecordingEnabled = captureMode != .singleWide
@@ -400,6 +389,26 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       || (width == targetVideoHeight && height == targetVideoWidth)
   }
 
+  private static func isTargetDepthResolution(_ dimensions: CMVideoDimensions) -> Bool {
+    let width = Int(dimensions.width)
+    let height = Int(dimensions.height)
+    return isTargetDepthResolution(width: width, height: height)
+  }
+
+  private static func isTargetDepthResolution(width: Int, height: Int) -> Bool {
+    (width == targetDepthWidth && height == targetDepthHeight)
+      || (width == targetDepthHeight && height == targetDepthWidth)
+  }
+
+  private static func supportsFrameRate(_ format: AVCaptureDevice.Format, fps: Double) -> Bool {
+    let ranges = format.videoSupportedFrameRateRanges
+    guard !ranges.isEmpty, fps.isFinite else { return false }
+    let eps = 0.01
+    return ranges.contains { range in
+      range.minFrameRate - eps <= fps && fps <= range.maxFrameRate + eps
+    }
+  }
+
   private static func colorPreferenceScore(_ subtype: OSType) -> Int64 {
     switch subtype {
     case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
@@ -412,38 +421,53 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   }
 
   private static func pickPreferredVideoFormat(device: AVCaptureDevice, requireDepth: Bool) -> AVCaptureDevice.Format? {
-    var best: AVCaptureDevice.Format?
-    var bestScore = Int64.min
+    func pick(requireFrameRate: Bool) -> AVCaptureDevice.Format? {
+      var best: AVCaptureDevice.Format?
+      var bestScore = Int64.min
 
-    for format in device.formats {
-      if requireDepth && format.supportedDepthDataFormats.isEmpty {
-        continue
+      for format in device.formats {
+        if requireDepth && format.supportedDepthDataFormats.isEmpty {
+          continue
+        }
+
+        let dim = format.formatDescription.dimensions
+        guard isTargetResolution(dim) else {
+          continue
+        }
+
+        if requireFrameRate, !supportsFrameRate(format, fps: targetCaptureFps) {
+          continue
+        }
+
+        let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+        let colorScore = colorPreferenceScore(subtype)
+        let hdrPenalty: Int64 = format.isVideoHDRSupported ? 1 : 0
+        let score = colorScore * 10 - hdrPenalty
+
+        if score > bestScore {
+          bestScore = score
+          best = format
+        }
       }
 
-      let dim = format.formatDescription.dimensions
-      guard isTargetResolution(dim) else {
-        continue
-      }
-
-      let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
-      let colorScore = colorPreferenceScore(subtype)
-      let hdrPenalty: Int64 = format.isVideoHDRSupported ? 1 : 0
-      let score = colorScore * 10 - hdrPenalty
-
-      if score > bestScore {
-        bestScore = score
-        best = format
-      }
+      return best
     }
 
-    return best
+    if let preferred = pick(requireFrameRate: true) {
+      return preferred
+    }
+    return pick(requireFrameRate: false)
   }
 
   private static func pickDepthDataFormat(for videoFormat: AVCaptureDevice.Format) -> AVCaptureDevice.Format? {
+    let allCandidates = videoFormat.supportedDepthDataFormats
+    let targetCandidates = allCandidates.filter { isTargetDepthResolution($0.formatDescription.dimensions) }
+    let candidates = targetCandidates.isEmpty ? allCandidates : targetCandidates
+
     var best: AVCaptureDevice.Format?
     var bestScore = Int64.min
 
-    for depthFormat in videoFormat.supportedDepthDataFormats {
+    for depthFormat in candidates {
       let depthDesc = depthFormat.formatDescription
       let dim = depthDesc.dimensions
       let area = Int64(dim.width) * Int64(dim.height)
@@ -499,14 +523,70 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       guard let device = discovery.devices.first(where: { $0.deviceType == type }) else {
         continue
       }
-      guard let videoFormat = pickPreferredVideoFormat(device: device, requireDepth: true) else {
-        continue
+      if let picked = pickDepthVideoFormatAndDepthFormat(device: device, requireFrameRate: true) {
+        return (device, picked.videoFormat, picked.depthFormat)
       }
-      let depthFormat = pickDepthDataFormat(for: videoFormat)
-      return (device, videoFormat, depthFormat)
+      if let picked = pickDepthVideoFormatAndDepthFormat(device: device, requireFrameRate: false) {
+        return (device, picked.videoFormat, picked.depthFormat)
+      }
     }
 
     return nil
+  }
+
+  private static func pickDepthVideoFormatAndDepthFormat(
+    device: AVCaptureDevice,
+    requireFrameRate: Bool
+  ) -> (videoFormat: AVCaptureDevice.Format, depthFormat: AVCaptureDevice.Format?)? {
+    var candidates: [AVCaptureDevice.Format] = []
+    candidates.reserveCapacity(16)
+
+    for format in device.formats {
+      guard !format.supportedDepthDataFormats.isEmpty else {
+        continue
+      }
+
+      let dim = format.formatDescription.dimensions
+      guard isTargetResolution(dim) else {
+        continue
+      }
+
+      if requireFrameRate, !supportsFrameRate(format, fps: targetCaptureFps) {
+        continue
+      }
+
+      candidates.append(format)
+    }
+
+    guard !candidates.isEmpty else {
+      return nil
+    }
+
+    let candidatesWithTargetDepth = candidates.filter { format in
+      format.supportedDepthDataFormats.contains { depthFormat in
+        isTargetDepthResolution(depthFormat.formatDescription.dimensions)
+      }
+    }
+    let effectiveCandidates = candidatesWithTargetDepth.isEmpty ? candidates : candidatesWithTargetDepth
+
+    var best: AVCaptureDevice.Format?
+    var bestScore = Int64.min
+    for format in effectiveCandidates {
+      let subtype = CMFormatDescriptionGetMediaSubType(format.formatDescription)
+      let colorScore = colorPreferenceScore(subtype)
+      let hdrPenalty: Int64 = format.isVideoHDRSupported ? 1 : 0
+      let score = colorScore * 10 - hdrPenalty
+      if score > bestScore {
+        bestScore = score
+        best = format
+      }
+    }
+
+    guard let videoFormat = best else {
+      return nil
+    }
+    let depthFormat = pickDepthDataFormat(for: videoFormat)
+    return (videoFormat, depthFormat)
   }
 
   private static func disableHdrIfPossible(device: AVCaptureDevice) {
@@ -519,19 +599,24 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   /// Lock to a stable frame rate to reduce capture jitter that can hurt SLAM tracking.
   private static func lockFrameRateIfPossible(device: AVCaptureDevice, preferredFps: Double = targetCaptureFps) {
     let ranges = device.activeFormat.videoSupportedFrameRateRanges
-    guard !ranges.isEmpty, preferredFps > 0 else { return }
+    guard !ranges.isEmpty, preferredFps > 0, preferredFps.isFinite else { return }
 
-    let fps: Double
-    if ranges.contains(where: { $0.minFrameRate <= preferredFps && preferredFps <= $0.maxFrameRate }) {
-      fps = preferredFps
-    } else if let maxRange = ranges.max(by: { $0.maxFrameRate < $1.maxFrameRate }) {
-      fps = maxRange.maxFrameRate
-    } else {
-      return
+    var bestFps: Double?
+    var bestDiff = Double.greatestFiniteMagnitude
+    for range in ranges {
+      let clamped = min(max(preferredFps, range.minFrameRate), range.maxFrameRate)
+      let diff = abs(clamped - preferredFps)
+      if diff < bestDiff - 0.0001
+        || (abs(diff - bestDiff) <= 0.0001 && (bestFps == nil || clamped < bestFps!))
+      {
+        bestFps = clamped
+        bestDiff = diff
+      }
     }
 
-    guard fps.isFinite, fps > 0 else { return }
-    let frameDuration = CMTime(value: 1, timescale: Int32(max(1, Int(fps.rounded()))))
+    guard let fps = bestFps, fps.isFinite, fps > 0 else { return }
+    let timescale = Int32(max(1, Int((fps * 1_000_000).rounded())))
+    let frameDuration = CMTime(value: 1_000_000, timescale: timescale)
     device.activeVideoMinFrameDuration = frameDuration
     device.activeVideoMaxFrameDuration = frameDuration
   }
@@ -739,7 +824,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       lastSecondPrincipalPointX = cx
       lastSecondPrincipalPointY = cy
       didUpdateSecondIntrinsics = fx > 1 && fy > 1
-      lastDepthToWideExtrinsic = Self.depthToWideExtrinsicRows(cal)
     }
 
     processVideoSampleBuffer(
@@ -751,91 +835,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   }
 
   /// 将深度图转为 BGRA8，用于写入 `frames2/*.png`。
-  private static func depthFloat32ToGrayBGRA(depthData: AVDepthData) -> CVPixelBuffer? {
-    let converted = depthData.converting(toDepthDataType: kCVPixelFormatType_DepthFloat32)
-    let depthMap = converted.depthDataMap
-
-    let w = CVPixelBufferGetWidth(depthMap)
-    let h = CVPixelBufferGetHeight(depthMap)
-    let pf = CVPixelBufferGetPixelFormatType(depthMap)
-    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
-
-    guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
-    let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
-    let nearMeters = Self.depthVisualizationNearMeters
-    let farMeters = max(nearMeters + 0.001, Self.depthVisualizationFarMeters)
-    let invRange: Float = 1.0 / (farMeters - nearMeters)
-
-    func readDepth(x: Int, y: Int) -> Float {
-      let o = y * rowBytes + x * MemoryLayout<Float>.size
-      guard pf == kCVPixelFormatType_DepthFloat32 else { return .nan }
-      return base.load(fromByteOffset: o, as: Float.self)
-    }
-
-    var outBuf: CVPixelBuffer?
-    let attrs: [CFString: Any] = [
-      kCVPixelBufferCGImageCompatibilityKey: true,
-      kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-    ]
-    CVPixelBufferCreate(
-      kCFAllocatorDefault,
-      w,
-      h,
-      kCVPixelFormatType_32BGRA,
-      attrs as CFDictionary,
-      &outBuf
-    )
-    guard let out = outBuf else { return nil }
-
-    CVPixelBufferLockBaseAddress(out, [])
-    defer { CVPixelBufferUnlockBaseAddress(out, []) }
-    guard let outBase = CVPixelBufferGetBaseAddress(out) else { return nil }
-    let outRowBytes = CVPixelBufferGetBytesPerRow(out)
-    for y in 0..<h {
-      var outRow = outBase.advanced(by: y * outRowBytes).assumingMemoryBound(to: UInt8.self)
-      for x in 0..<w {
-        let v = readDepth(x: x, y: y)
-        let g: UInt8
-        if v.isFinite, v > 0 {
-          let clamped = min(max(v, nearMeters), farMeters)
-          let normalized = ((farMeters - clamped) * invRange).clamped(to: 0...1)
-          let emphasized = normalized.squareRoot()
-          g = UInt8(min(255, max(0, emphasized * 255)))
-        } else {
-          g = 0
-        }
-        outRow[0] = g
-        outRow[1] = g
-        outRow[2] = g
-        outRow[3] = 255
-        outRow = outRow.advanced(by: 4)
-      }
-    }
-    return out
-  }
-
-  private static func makeSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
-    var timing = CMSampleTimingInfo(
-      duration: CMTime.invalid,
-      presentationTimeStamp: pts,
-      decodeTimeStamp: CMTime.invalid
-    )
-    var formatDesc: CMFormatDescription?
-    CMVideoFormatDescriptionCreateForImageBuffer(allocator: kCFAllocatorDefault, imageBuffer: pixelBuffer, formatDescriptionOut: &formatDesc)
-    guard let fmt = formatDesc else { return nil }
-
-    var sb: CMSampleBuffer?
-    CMSampleBufferCreateReadyWithImageBuffer(
-      allocator: kCFAllocatorDefault,
-      imageBuffer: pixelBuffer,
-      formatDescription: fmt,
-      sampleTiming: &timing,
-      sampleBufferOut: &sb
-    )
-    return sb
-  }
-
   // MARK: - AVCaptureVideoDataOutputSampleBufferDelegate（MultiCam / 单目）
 
   func captureOutput(
@@ -873,18 +872,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     else {
       return
     }
-
-    if audioSampleRate <= 0 || audioChannelCount <= 0,
-       let format = CMSampleBufferGetFormatDescription(sampleBuffer),
-       let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(format)
-    {
-      audioSampleRate = asbd.pointee.mSampleRate
-      audioChannelCount = Int(asbd.pointee.mChannelsPerFrame)
-    }
-
-    if input.append(sampleBuffer) {
-      didAppendAudioSample = true
-    }
+    _ = input.append(sampleBuffer)
   }
 
   private func handleMultiCamOutput(output: AVCaptureOutput, sampleBuffer: CMSampleBuffer) {
@@ -1018,56 +1006,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
   }
 
-  private static func retimeSampleBufferIfNeeded(_ sampleBuffer: CMSampleBuffer, to pts: CMTime) -> CMSampleBuffer? {
-    let currentPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-    if CMTimeCompare(currentPts, pts) == 0 {
-      return sampleBuffer
-    }
-
-    var timingCount = 0
-    guard CMSampleBufferGetSampleTimingInfoArray(sampleBuffer, entryCount: 0, arrayToFill: nil, entriesNeededOut: &timingCount) == noErr,
-          timingCount > 0
-    else {
-      return nil
-    }
-
-    var timings = Array(
-      repeating: CMSampleTimingInfo(
-        duration: .invalid,
-        presentationTimeStamp: .invalid,
-        decodeTimeStamp: .invalid
-      ),
-      count: timingCount
-    )
-
-    guard CMSampleBufferGetSampleTimingInfoArray(
-      sampleBuffer,
-      entryCount: timingCount,
-      arrayToFill: &timings,
-      entriesNeededOut: &timingCount
-    ) == noErr
-    else {
-      return nil
-    }
-
-    for i in 0..<timings.count {
-      timings[i].presentationTimeStamp = pts
-      timings[i].decodeTimeStamp = .invalid
-    }
-
-    var retimed: CMSampleBuffer?
-    let status = CMSampleBufferCreateCopyWithNewTiming(
-      allocator: kCFAllocatorDefault,
-      sampleBuffer: sampleBuffer,
-      sampleTimingEntryCount: timings.count,
-      sampleTimingArray: &timings,
-      sampleBufferOut: &retimed
-    )
-
-    guard status == noErr else { return nil }
-    return retimed
-  }
-
   private func exportFrames2PngIfNeeded(
     wideSample: CMSampleBuffer,
     secondSample: CMSampleBuffer?,
@@ -1192,6 +1130,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
         AVVideoCompressionPropertiesKey: [
           AVVideoAverageBitRateKey: width * height * 4,
           AVVideoProfileLevelKey: AVVideoProfileLevelH264HighAutoLevel,
+          AVVideoExpectedSourceFrameRateKey: Int(Self.targetCaptureFps.rounded()),
           AVVideoMaxKeyFrameIntervalKey: 60,
         ] as [String: Any],
       ]
@@ -1285,57 +1224,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
   }
 
   /// AVCameraCalibrationData.extrinsicMatrix（3x4）扩展为 4x4 齐次矩阵。
-  private static func depthToWideExtrinsicRows(_ calibration: AVCameraCalibrationData) -> [[Double]] {
-    let e = calibration.extrinsicMatrix
-    return [
-      [Double(e.columns.0.x), Double(e.columns.1.x), Double(e.columns.2.x), Double(e.columns.3.x)],
-      [Double(e.columns.0.y), Double(e.columns.1.y), Double(e.columns.2.y), Double(e.columns.3.y)],
-      [Double(e.columns.0.z), Double(e.columns.1.z), Double(e.columns.2.z), Double(e.columns.3.z)],
-      [0, 0, 0, 1],
-    ]
-  }
-
-  private static func multiply4x4(_ left: [[Double]], _ right: [[Double]]) -> [[Double]] {
-    var out = Array(repeating: Array(repeating: 0.0, count: 4), count: 4)
-    for r in 0..<4 {
-      for c in 0..<4 {
-        var v = 0.0
-        for k in 0..<4 {
-          v += left[r][k] * right[k][c]
-        }
-        out[r][c] = v
-      }
-    }
-    return out
-  }
-
   /// 针对旋转+平移的刚体变换求逆。
-  private static func invertRigid4x4(_ matrix: [[Double]]) -> [[Double]]? {
-    guard matrix.count == 4, matrix.allSatisfy({ $0.count == 4 }) else {
-      return nil
-    }
-
-    let r00 = matrix[0][0], r01 = matrix[0][1], r02 = matrix[0][2]
-    let r10 = matrix[1][0], r11 = matrix[1][1], r12 = matrix[1][2]
-    let r20 = matrix[2][0], r21 = matrix[2][1], r22 = matrix[2][2]
-    let tx = matrix[0][3], ty = matrix[1][3], tz = matrix[2][3]
-
-    let rt00 = r00, rt01 = r10, rt02 = r20
-    let rt10 = r01, rt11 = r11, rt12 = r21
-    let rt20 = r02, rt21 = r12, rt22 = r22
-
-    let itx = -(rt00 * tx + rt01 * ty + rt02 * tz)
-    let ity = -(rt10 * tx + rt11 * ty + rt12 * tz)
-    let itz = -(rt20 * tx + rt21 * ty + rt22 * tz)
-
-    return [
-      [rt00, rt01, rt02, itx],
-      [rt10, rt11, rt12, ity],
-      [rt20, rt21, rt22, itz],
-      [0, 0, 0, 1],
-    ]
-  }
-
   private func appendFrameJsonl(
     number: Int,
     wideSample: CMSampleBuffer,
@@ -1352,18 +1241,21 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       "cameraInd": 0,
       "colorFormat": "rgb",
     ]
+    var frame0Calibration: [String: Any]?
     if let cal = Self.intrinsicCalibration(from: wideSample) {
       lastFocalLengthX = cal.fx
       lastFocalLengthY = cal.fy
       lastPrincipalPointX = cal.cx
       lastPrincipalPointY = cal.cy
       didUpdateIntrinsicsFromSample = true
-      frame0["calibration"] = [
+      let c0: [String: Any] = [
         "focalLengthX": cal.fx,
         "focalLengthY": cal.fy,
         "principalPointX": cal.cx,
         "principalPointY": cal.cy,
       ]
+      frame0Calibration = c0
+      frame0["calibration"] = c0
     }
     frame0["exposureTimeSeconds"] = lockedExposureDurationSeconds
 
@@ -1390,20 +1282,8 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       if isDepthGray {
         frame1["colorFormat"] = "gray"
         frame1["depthScale"] = jsonDepthScale
-        if didUpdateSecondIntrinsics {
-          frame1["calibration"] = [
-            "focalLengthX": lastSecondFocalLengthX,
-            "focalLengthY": lastSecondFocalLengthY,
-            "principalPointX": lastSecondPrincipalPointX,
-            "principalPointY": lastSecondPrincipalPointY,
-          ]
-        } else if let cal = Self.intrinsicCalibration(from: wideSample) {
-          frame1["calibration"] = [
-            "focalLengthX": cal.fx,
-            "focalLengthY": cal.fy,
-            "principalPointX": cal.cx,
-            "principalPointY": cal.cy,
-          ]
+        if let c0 = frame0Calibration {
+          frame1["calibration"] = c0
         }
       } else {
         guard let sb2 = secondSample else { return }
@@ -1728,7 +1608,7 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     if motionManager.isMagnetometerAvailable {
-      motionManager.magnetometerUpdateInterval = 1.0 / 60.0
+      motionManager.magnetometerUpdateInterval = 1.0 / 100.0
       motionManager.startMagnetometerUpdates(to: magnetometerQueue) { [weak self] data, _ in
         guard let self = self, let d = data else { return }
         self.syncQueue.async {
@@ -1810,8 +1690,6 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
     }
 
     let imuI = Self.captureConventionImuToCameraMatrix()
-    let primaryImuSource = "capture_convention_back_camera_axes"
-    var secondaryImuSource = "not_applicable_single_camera"
 
     var cam1: [String: Any] = [
       "model": "pinhole",
@@ -1841,19 +1719,24 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
         w2 = videoWidth2
         h2 = videoHeight2
       }
-      let fx2 = didUpdateSecondIntrinsics && lastSecondFocalLengthX > 1 ? lastSecondFocalLengthX : fx1
-      let fy2 = didUpdateSecondIntrinsics && lastSecondFocalLengthY > 1 ? lastSecondFocalLengthY : fy1
-      let cx2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointX : Double(w2) / 2.0
-      let cy2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointY : Double(h2) / 2.0
-      var imu2 = imuI
-      if captureMode == .depthAndWide,
-         let depthToWide = lastDepthToWideExtrinsic,
-         let wideToDepth = Self.invertRigid4x4(depthToWide)
-      {
-        imu2 = Self.multiply4x4(wideToDepth, imuI)
-        secondaryImuSource = "depth_calibration_extrinsic_composed"
+      let fx2: Double
+      let fy2: Double
+      let cx2: Double
+      let cy2: Double
+      if captureMode == .depthAndWide {
+        fx2 = fx1
+        fy2 = fy1
+        cx2 = cx1
+        cy2 = cy1
       } else {
-        secondaryImuSource = "capture_convention_copy_primary"
+        fx2 = didUpdateSecondIntrinsics && lastSecondFocalLengthX > 1 ? lastSecondFocalLengthX : fx1
+        fy2 = didUpdateSecondIntrinsics && lastSecondFocalLengthY > 1 ? lastSecondFocalLengthY : fy1
+        cx2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointX : Double(w2) / 2.0
+        cy2 = didUpdateSecondIntrinsics ? lastSecondPrincipalPointY : Double(h2) / 2.0
+      }
+      var imu2 = imuI
+      if captureMode == .depthAndWide {
+        imu2[0][3] = Self.spectacularSecondaryImuTranslationX
       }
       let cam2: [String: Any] = [
         "model": "pinhole",
@@ -1868,34 +1751,14 @@ final class SlamRecordingSession: NSObject, AVCaptureDataOutputSynchronizerDeleg
       cameras.append(cam2)
     }
 
-    lastPrimaryImuToCameraSource = primaryImuSource
-    lastSecondaryImuToCameraSource = secondaryImuSource
-
     writeJsonFile(name: "calibration.json", object: ["cameras": cameras])
   }
 
   private func writeMetadataJson() {
     let model = SlamRecordingSession.machineModelName()
-    let captureModeName: String
-    switch captureMode {
-    case .depthAndWide:
-      captureModeName = "depthAndWide"
-    case .multiCamRgb:
-      captureModeName = "multiCamRgb"
-    case .singleWide:
-      captureModeName = "singleWide"
-    }
     let root: [String: Any] = [
       "device_model": model,
       "platform": "ios",
-      "capture_mode": captureModeName,
-      "depth_mode_required": requireDepthAndWideMode,
-      "audio_enabled": audioCaptureEnabled,
-      "audio_permission_granted": audioPermissionGranted,
-      "audio_track_expected": requestedAudioCapture,
-      "audio_track_present": didAppendAudioSample,
-      "audio_sample_rate": audioSampleRate,
-      "audio_channel_count": audioChannelCount,
     ]
     writeJsonFile(name: "metadata.json", object: root)
   }
